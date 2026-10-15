@@ -1,5 +1,11 @@
 import asyncio
 import html
+import io
+import re
+import hashlib
+import zipfile
+from zoneinfo import ZoneInfo
+from xml.sax.saxutils import escape as xml_escape
 import json
 import logging
 import math
@@ -20,6 +26,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.base import BaseStorage, StorageKey
 from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     ChatMemberUpdated,
     InlineKeyboardButton,
@@ -31,7 +38,7 @@ from aiogram.types import (
 )
 
 
-BOT_VERSION = "2.1.3"
+BOT_VERSION = "2.1.4"
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "788167958"))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/remarenko_free.sqlite3")
@@ -94,6 +101,7 @@ def connect() -> sqlite3.Connection:
         os.makedirs(folder, exist_ok=True)
     db = sqlite3.connect(DATABASE_PATH, timeout=20, factory=ClosingConnection)
     db.row_factory = sqlite3.Row
+    db.create_function("casefold", 1, lambda value: str(value or "").casefold(), deterministic=True)
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA busy_timeout=20000")
     db.execute(
@@ -421,7 +429,7 @@ TARIFF_NAMES = {'BASIC': 'Базовий', 'GROUP': 'Груповий', 'MASTER'
 
 
 def lead_buttons(user_id: int, origin: str = 'new', page: int = 0):
-    if origin not in LEAD_STATUSES or page < 0:
+    if not resolve_lead_view(origin) or page < 0:
         origin, page = 'new', 0
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text='💬 Відкрити користувача', url=f'tg://user?id={user_id}')],
@@ -498,41 +506,168 @@ async def deliver_lead_notifications(bot: Bot) -> None:
                     db.execute('UPDATE lead_notifications SET sent_at=?,last_error=NULL WHERE user_id=? AND revision=?', (now_iso(), row['user_id'], row['revision']))
 
 
-async def show_leads(message: Message, status: str = 'new', page: int = 0, edit: bool = False) -> None:
-    if status not in LEAD_STATUSES or page < 0:
-        return
-    condition = '1=1' if status == 'people' else '(recommendation IS NOT NULL OR contact IS NOT NULL)'
+# View tokens keep callbacks short while preserving search/filter context across restarts.
+STAGE_FILTERS = {'any': 'Усі етапи', 'received': 'Отримали урок',
+    'watched': 'Позначили переглянутим', 'started': 'Почали анкету',
+    'completed': 'Завершили анкету', 'contact': 'Залишили контакт'}
+DATE_FILTERS = {'any': 'Увесь час', 'today': 'Сьогодні', 'week': 'Останні 7 днів'}
+KYIV = ZoneInfo('Europe/Kyiv')
+
+
+def resolve_lead_view(origin: str):
+    if origin in LEAD_STATUSES:
+        return {'status': origin, 'stage': 'any', 'tariff': 'any', 'date': 'any', 'search': ''}
+    if not re.fullmatch(r'v[0-9a-f]{16}', origin):
+        return None
+    raw = get_setting('lead_view:' + origin)
+    return json.loads(raw) if raw else None
+
+
+def save_lead_view(view: dict) -> str:
+    raw = json.dumps(view, ensure_ascii=False, sort_keys=True)
+    token = 'v' + hashlib.sha256(raw.encode()).hexdigest()[:16]
+    if get_setting('lead_view:' + token) != raw:
+        set_setting('lead_view:' + token, raw)
+    return token
+
+
+def lead_condition(view: dict, status=None):
+    status = status or view['status']
+    clauses = ['1=1' if status == 'people' else '(recommendation IS NOT NULL OR contact IS NOT NULL)']
     params = []
     if status in {'new', 'work', 'done'}:
-        condition += ' AND lead_status=?'
+        clauses.append('lead_status=?')
         params.append(status)
+    stage = view.get('stage', 'any')
+    milestones = {'received': 'lesson_received_at', 'watched': 'lesson_completed_at',
+                  'started': 'questionnaire_started_at', 'completed': 'recommendation', 'contact': 'contact'}
+    if stage in milestones:
+        clauses.append(f"{milestones[stage]} IS NOT NULL AND {milestones[stage]}!=''")
+    if view.get('tariff', 'any') in TARIFF_NAMES:
+        clauses.append('recommendation=?')
+        params.append(view['tariff'])
+    # Date means first entry into the bot; a later status change cannot change this date.
+    if view.get('date') in {'today', 'week'}:
+        now = utc_now()
+        lower = now.astimezone(KYIV).replace(hour=0, minute=0, second=0, microsecond=0).astimezone(timezone.utc) if view['date']=='today' else now-timedelta(days=7)
+        clauses.append('created_at>=? AND created_at<=?')
+        params.extend([lower.isoformat(), now.isoformat()])
+    query = view.get('search', '').strip().lstrip('@')
+    if query:
+        # instr treats %, _ and SQL punctuation literally. casefold supports Ukrainian names.
+        clauses.append("(instr(casefold(COALESCE(first_name,'')),?)>0 OR instr(casefold(COALESCE(username,'')),?)>0 OR instr(CAST(telegram_id AS TEXT),?)>0 OR instr(casefold(COALESCE(contact,'')),?)>0)")
+        params.extend([query.casefold()]*4)
+    return ' AND '.join(clauses), params
+
+
+def lead_rows(view: dict, page=None):
+    paginated = page is not None
+    condition, params = lead_condition(view)
     with connect() as db:
         count = db.execute(f'SELECT COUNT(*) FROM users WHERE {condition}', params).fetchone()[0]
-        page = min(page, max(0, (count - 1) // 8))
-        rows = db.execute(f'SELECT * FROM users WHERE {condition} ORDER BY updated_at DESC,telegram_id LIMIT 8 OFFSET ?', (*params, page*8)).fetchall()
-    text = f'<b>{LEAD_STATUSES[status]}</b> · {count}\nСторінка {page + 1}\n\n'
+        page = min(max(0, page or 0), max(0, (count-1)//8))
+        suffix, extra = (' LIMIT 8 OFFSET ?', [page*8]) if paginated else ('', [])
+        rows = db.execute(f'SELECT * FROM users WHERE {condition} ORDER BY updated_at DESC,telegram_id'+suffix, (*params,*extra)).fetchall()
+    return count, page, rows
+
+
+def view_description(view):
+    lines = []
+    if view.get('stage', 'any') != 'any': lines.append('Етап: '+STAGE_FILTERS[view['stage']])
+    if view.get('tariff', 'any') != 'any': lines.append('Тариф: '+TARIFF_NAMES[view['tariff']])
+    if view.get('date', 'any') != 'any': lines.append('Вхід у бот: '+DATE_FILTERS[view['date']])
+    if view.get('search'): lines.append('Пошук: '+view['search'])
+    return '\n'.join(lines)
+
+
+async def edit_admin(message, text, markup):
+    try:
+        await message.edit_text(text, reply_markup=markup)
+    except TelegramBadRequest as error:
+        if 'message is not modified' not in str(error).lower(): raise
+
+
+async def show_leads(message: Message, status: str = 'new', page: int = 0, edit: bool = False) -> None:
+    view = resolve_lead_view(status)
+    if not view or page < 0: return
+    count, page, rows = lead_rows(view, page)
+    set_setting('admin_current_view', status)
+    text = f'<b>{LEAD_STATUSES[view["status"]]}</b> · {count}\nСторінка {page+1} із {max(1,(count+7)//8)}\n'
+    description = view_description(view)
+    if description: text += html.escape(description)+'\n'
+    text += '\n'
     keyboard = []
     for row in rows:
         name = row['first_name'] or row['username'] or str(row['telegram_id'])
         label = TARIFF_NAMES.get(row['recommendation']) or STAGE_LABELS.get(row['stage'], 'У боті')
-        text += f"• {html.escape(name)} · {html.escape(label)}\n"
+        text += f"• {html.escape(name[:60])} · {html.escape(label)}\n"
         keyboard.append([InlineKeyboardButton(text=f'{name[:40]} · {label}', callback_data=f'adminlead:detail:{row["telegram_id"]}:{status}:{page}')])
-    if not rows:
-        text += 'У цьому списку поки нікого немає.'
+    if not rows: text += 'За цим відбором нікого не знайдено.'
     nav = []
-    if page: nav.append(InlineKeyboardButton(text='⬅️', callback_data=f'adminlead:list:{status}:{page-1}'))
-    if (page+1)*8 < count: nav.append(InlineKeyboardButton(text='➡️', callback_data=f'adminlead:list:{status}:{page+1}'))
+    last = max(0,(count-1)//8)
+    for label, target in [('⏮',0),('⬅️',page-1),('➡️',page+1),('⏭',last)]:
+        if (label in {'⏮','⬅️'} and page>0) or (label in {'➡️','⏭'} and page<last):
+            nav.append(InlineKeyboardButton(text=label, callback_data=f'adminlead:list:{status}:{target}'))
     if nav: keyboard.append(nav)
-    for key in ('new', 'work', 'done', 'all', 'people'):
-        keyboard.append([InlineKeyboardButton(text=LEAD_STATUSES[key], callback_data=f'adminlead:list:{key}:0')])
-    if edit:
-        try:
-            await message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
-        except TelegramBadRequest as error:
-            if 'message is not modified' not in str(error).lower():
-                raise
-    else:
-        await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+    keyboard.append([InlineKeyboardButton(text='🔎 Пошук',callback_data=f'av:search:{status}'),
+                     InlineKeyboardButton(text='🎛 Фільтри',callback_data=f'av:filters:{status}')])
+    keyboard.append([InlineKeyboardButton(text='🔢 До сторінки',callback_data=f'av:page:{status}'),
+                     InlineKeyboardButton(text='📥 Excel',callback_data=f'av:export:{status}')])
+    with connect() as db:
+        for key in LEAD_STATUSES:
+            condition, params = lead_condition(view, key)
+            n = db.execute(f'SELECT COUNT(*) FROM users WHERE {condition}',params).fetchone()[0]
+            target = key if not description else save_lead_view({**view,'status':key})
+            keyboard.append([InlineKeyboardButton(text=f'{LEAD_STATUSES[key]} · {n}',callback_data=f'adminlead:list:{target}:0')])
+    if description: keyboard.append([InlineKeyboardButton(text='✖️ Скинути пошук і фільтри',callback_data=f'adminlead:list:{view["status"]}:0')])
+    markup = InlineKeyboardMarkup(inline_keyboard=keyboard)
+    if edit: await edit_admin(message,text,markup)
+    else: await message.answer(text,reply_markup=markup)
+
+
+def excel_bytes(rows):
+    """Minimal XLSX with explicit text cells: user input can never become an Excel formula."""
+    fields = [('telegram_id','Telegram ID'),('first_name','Ім’я'),('username','Telegram'),
+        ('created_at','Перший вхід (Київ)'),('updated_at','Оновлено (Київ)'),('source','Джерело'),
+        ('stage','Етап'),('experience','Досвід'),('capital','Капітал'),('goal','Ціль'),
+        ('support','Підтримка'),('recommendation','Рекомендований тариф'),('contact','Контакт'),
+        ('lead_status','Статус роботи')]
+    def clean(value):
+        return xml_escape(''.join(c for c in str(value or '') if c in '\n\r\t' or 32<=ord(c)<=0xD7FF or 0xE000<=ord(c)<=0xFFFD or 0x10000<=ord(c)<=0x10FFFF)[:32767])
+    def col(i):
+        result=''
+        while i:
+            i,n=divmod(i-1,26); result=chr(65+n)+result
+        return result
+    data = [[label for _,label in fields]]
+    for row in rows:
+        values=[]
+        for key,_ in fields:
+            value=row[key]
+            if key=='recommendation': value=TARIFF_NAMES.get(value,value)
+            if key=='stage': value=STAGE_LABELS.get(value,value)
+            if key=='lead_status': value=LEAD_STATUSES.get(value,value)
+            if key in {'created_at','updated_at'} and value:
+                value=datetime.fromisoformat(value).astimezone(KYIV).strftime('%d.%m.%Y %H:%M')
+            values.append(value)
+        data.append(values)
+    xmlrows=[]
+    for n,values in enumerate(data,1):
+        cells=''.join(f'<c r="{col(i)}{n}" t="inlineStr" s="{1 if n==1 else 0}"><is><t xml:space="preserve">{clean(v)}</t></is></c>' for i,v in enumerate(values,1))
+        xmlrows.append(f'<row r="{n}">{cells}</row>')
+    end=f'N{len(data)}'
+    sheet='<?xml version="1.0" encoding="UTF-8"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+    sheet+='<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>'
+    sheet+='<cols><col min="1" max="14" width="25" customWidth="1"/></cols><sheetData>'+''.join(xmlrows)+f'</sheetData><autoFilter ref="A1:{end}"/></worksheet>'
+    output=io.BytesIO()
+    with zipfile.ZipFile(output,'w',zipfile.ZIP_DEFLATED) as z:
+        z.writestr('[Content_Types].xml','<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/></Types>')
+        z.writestr('_rels/.rels','<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>')
+        z.writestr('xl/workbook.xml','<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><sheets><sheet name="Заявки" sheetId="1" r:id="rId1"/></sheets></workbook>')
+        z.writestr('xl/_rels/workbook.xml.rels','<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/><Relationship Id="rId2" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>')
+        z.writestr('xl/styles.xml','<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main"><fonts count="2"><font><sz val="11"/><name val="Calibri"/></font><font><b/><sz val="11"/><name val="Calibri"/></font></fonts><fills count="2"><fill><patternFill patternType="none"/></fill><fill><patternFill patternType="gray125"/></fill></fills><borders count="1"><border/></borders><cellStyleXfs count="1"><xf/></cellStyleXfs><cellXfs count="2"><xf fontId="0" fillId="0" borderId="0" xfId="0"><alignment vertical="top" wrapText="1"/></xf><xf fontId="1" fillId="0" borderId="0" xfId="0" applyFont="1"><alignment vertical="top" wrapText="1"/></xf></cellXfs><cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles></styleSheet>')
+        z.writestr('xl/worksheets/sheet1.xml',sheet)
+    return output.getvalue()
 
 
 def main_menu() -> InlineKeyboardMarkup:
@@ -826,6 +961,85 @@ async def send_recommendation(message: Message, data: dict[str, str]) -> None:
     await deliver_lead_notifications(message.bot)
 
 
+async def show_lead_filters(message, origin):
+    view = resolve_lead_view(origin)
+    if not view: return
+    keyboard=[]
+    for label,field,choices in [('Етап','stage',STAGE_FILTERS),('Тариф','tariff',{'any':'Усі тарифи',**TARIFF_NAMES}),('Перший вхід у бот','date',DATE_FILTERS)]:
+        for value,name in choices.items():
+            mark='✅ ' if view.get(field,'any')==value else ''
+            keyboard.append([InlineKeyboardButton(text=f'{mark}{label}: {name}',callback_data=f'av:set:{origin}:{field}:{value}')])
+    keyboard.append([InlineKeyboardButton(text='📋 Показати список',callback_data=f'adminlead:list:{origin}:0')])
+    await edit_admin(message,'<b>🎛 Фільтри</b>\nМожна поєднувати етап, тариф, дату та пошук.\nЕтап показує всіх, хто до нього дійшов. Дата — перший вхід у бот.\nЛічильники категорій враховують цей відбір.',InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+
+@router.callback_query(F.data.startswith('av:'))
+async def admin_view_callback(callback: CallbackQuery):
+    if callback.from_user.id != ADMIN_CHAT_ID:
+        await callback.answer('Доступ лише для адміністратора',show_alert=True)
+        return
+    parts=(callback.data or '').split(':')
+    if len(parts)<3: return
+    action,origin=parts[1:3]
+    view=resolve_lead_view(origin)
+    if not view: 
+        await callback.answer('Відкрий /leads ще раз',show_alert=True)
+        return
+    await callback.answer()
+    set_setting('admin_pending_input','')
+    if action=='filters':
+        await show_lead_filters(callback.message,origin)
+    elif action=='set' and len(parts)==5:
+        field,value=parts[3:5]
+        valid={'stage':STAGE_FILTERS,'tariff':{'any':'',**TARIFF_NAMES},'date':DATE_FILTERS}
+        if field not in valid or value not in valid[field]: return
+        token=save_lead_view({**view,field:value})
+        await show_lead_filters(callback.message,token)
+    elif action in {'search','page'}:
+        set_setting('admin_pending_input',json.dumps({'action':action,'origin':origin}))
+        text=('🔎 Напиши ім’я, @нік, Telegram ID або частину контакту одним повідомленням. Пошук діє в поточній категорії та фільтрах.' if action=='search' else '🔢 Напиши номер сторінки одним повідомленням, наприклад: 12.')
+        await edit_admin(callback.message,text,InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='⬅️ Скасувати',callback_data=f'adminlead:list:{origin}:0')]]))
+    elif action=='export':
+        _,_,rows=lead_rows(view)
+        if not rows:
+            await callback.message.answer('За цим відбором немає записів для експорту.')
+            return
+        data=await asyncio.to_thread(excel_bytes,rows)
+        stamp=utc_now().astimezone(KYIV).strftime('%Y-%m-%d_%H-%M')
+        description=view_description(view)
+        caption=f'📥 {LEAD_STATUSES[view["status"]]} · {len(rows)} записів\n{description}\nЗнімок даних на момент експорту. Зміни в Excel не змінюють бот.'
+        await callback.message.answer_document(BufferedInputFile(data,filename=f'Remarenko_leads_{stamp}.xlsx'),caption=html.escape(caption[:1000]))
+
+
+def is_admin_list_input(message):
+    return (message.from_user.id==ADMIN_CHAT_ID and bool(message.text)
+            and not message.text.startswith('/') and bool(get_setting('admin_pending_input')))
+
+
+@router.message(is_admin_list_input)
+async def admin_list_input(message: Message):
+    pending=json.loads(get_setting('admin_pending_input') or '{}')
+    origin=pending.get('origin','new')
+    view=resolve_lead_view(origin)
+    if not view: return
+    value=(message.text or '').strip()
+    if pending.get('action')=='page':
+        count,_,_=lead_rows(view,0)
+        total=max(1,(count+7)//8)
+        if not value.isascii() or not value.isdigit() or not 1<=int(value)<=total:
+            await message.answer(f'Введи номер від 1 до {total}, або /leads для виходу.')
+            return
+        page=int(value)-1
+    else:
+        if not value or len(value)>100:
+            await message.answer('Введи від 1 до 100 символів, або /leads для виходу.')
+            return
+        origin=save_lead_view({**view,'search':value})
+        page=0
+    set_setting('admin_pending_input','')
+    await show_leads(message,origin,page)
+
+
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
     payload = "direct"
@@ -1009,12 +1223,13 @@ async def admin_lead_callback(callback: CallbackQuery) -> None:
     parts = (callback.data or '').split(':')
     try:
         if len(parts) == 4 and parts[1] == 'list':
+            set_setting('admin_pending_input','')
             await show_leads(callback.message, parts[2], int(parts[3]), edit=True)
         elif parts[1] in {'detail', 'status'}:
             offset = 3 if parts[1] == 'detail' else 4
             if len(parts) not in {offset, offset + 2}: return
             origin, page = (parts[offset], int(parts[offset+1])) if len(parts) == offset+2 else ('new', 0)
-            if origin not in LEAD_STATUSES or page < 0: return
+            if not resolve_lead_view(origin) or page < 0: return
             uid = int(parts[2])
             if parts[1] == 'status':
                 if parts[3] not in {'new', 'work', 'done'}: return
@@ -1043,12 +1258,14 @@ async def admin_lead_callback(callback: CallbackQuery) -> None:
 @router.message(Command('leads'))
 async def leads(message: Message) -> None:
     if message.from_user.id == ADMIN_CHAT_ID:
+        set_setting('admin_pending_input','')
         await show_leads(message)
 
 
 @router.message(Command('people'))
 async def people(message: Message) -> None:
     if message.from_user.id == ADMIN_CHAT_ID:
+        set_setting('admin_pending_input','')
         await show_leads(message, 'people')
 
 
