@@ -1,21 +1,27 @@
 import asyncio
 import html
+import json
 import logging
+import math
 import os
 import sqlite3
 from contextlib import suppress
+from dataclasses import asdict
+from urllib.parse import urlparse
 from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
-from aiogram.enums import ChatMemberStatus, ParseMode
+from aiogram.enums import ChatMemberStatus, ChatType, ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.storage.base import BaseStorage, StorageKey
+from aiogram.fsm.storage.memory import SimpleEventIsolation
 from aiogram.types import (
     CallbackQuery,
+    ChatMemberUpdated,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -25,7 +31,7 @@ from aiogram.types import (
 )
 
 
-BOT_VERSION = "2.0.0"
+BOT_VERSION = "2.1.0"
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "788167958"))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/remarenko_free.sqlite3")
@@ -38,7 +44,8 @@ CONTACT_URL = os.getenv("CONTACT_URL", "https://t.me/P2P_Marshal").strip()
 
 def env_number(name: str, default: float) -> float:
     try:
-        return max(0.0, float(os.getenv(name, str(default))))
+        value = float(os.getenv(name, str(default)))
+        return max(0.0, value) if math.isfinite(value) else default
     except ValueError:
         logging.warning("Invalid %s; using %s", name, default)
         return default
@@ -48,9 +55,13 @@ REMINDER_MINUTES = env_number("FUNNEL_REMINDER_MINUTES", 30)
 VALUE_HOURS = env_number("FUNNEL_VALUE_HOURS", 4)
 OFFER_HOURS = env_number("FUNNEL_OFFER_HOURS", 24)
 FINAL_HOURS = env_number("FUNNEL_FINAL_HOURS", 48)
-WORKER_INTERVAL_SECONDS = env_number("FUNNEL_WORKER_INTERVAL_SECONDS", 20)
+WORKER_INTERVAL_SECONDS = max(1, env_number("FUNNEL_WORKER_INTERVAL_SECONDS", 20))
+FORM_REMINDER_HOURS = env_number("FUNNEL_FORM_REMINDER_HOURS", 2)
 
 router = Router()
+router.message.filter(F.chat.type == ChatType.PRIVATE)
+router.callback_query.filter(F.message.chat.type == ChatType.PRIVATE)
+notification_lock = asyncio.Lock()
 
 
 class LeadForm(StatesGroup):
@@ -69,11 +80,19 @@ def now_iso() -> str:
     return utc_now().isoformat()
 
 
+class ClosingConnection(sqlite3.Connection):
+    def __exit__(self, *args):
+        try:
+            return super().__exit__(*args)
+        finally:
+            self.close()
+
+
 def connect() -> sqlite3.Connection:
     folder = os.path.dirname(DATABASE_PATH)
     if folder:
         os.makedirs(folder, exist_ok=True)
-    db = sqlite3.connect(DATABASE_PATH, timeout=20)
+    db = sqlite3.connect(DATABASE_PATH, timeout=20, factory=ClosingConnection)
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.execute("PRAGMA busy_timeout=20000")
@@ -99,9 +118,21 @@ def connect() -> sqlite3.Connection:
         """
     )
     existing = {row[1] for row in db.execute("PRAGMA table_info(users)")}
-    for column in ("support", "recommendation", "recommendation_reason"):
+    for column in ("support", "recommendation", "recommendation_reason",
+                   "lesson_received_at", "lesson_completed_at", "questionnaire_started_at"):
         if column not in existing:
             db.execute(f"ALTER TABLE users ADD COLUMN {column} TEXT")
+    if 'lead_status' not in existing:
+        db.execute("ALTER TABLE users ADD COLUMN lead_status TEXT NOT NULL DEFAULT 'new'")
+    if 'reminders_enabled' not in existing:
+        db.execute("ALTER TABLE users ADD COLUMN reminders_enabled INTEGER NOT NULL DEFAULT 1")
+    db.execute("CREATE TABLE IF NOT EXISTS form_state (key TEXT PRIMARY KEY, state TEXT, data TEXT NOT NULL DEFAULT '{}')")
+    db.execute("""CREATE TABLE IF NOT EXISTS lead_notifications (
+        user_id INTEGER PRIMARY KEY, text TEXT NOT NULL, due_at TEXT NOT NULL,
+        sent_at TEXT, attempts INTEGER NOT NULL DEFAULT 0, last_error TEXT)""")
+    db.execute("""CREATE TABLE IF NOT EXISTS channel_joins (
+        user_id INTEGER PRIMARY KEY, first_joined_at TEXT NOT NULL, last_joined_at TEXT NOT NULL,
+        via_bot_link INTEGER NOT NULL DEFAULT 0)""")
     db.execute(
         """
         CREATE TABLE IF NOT EXISTS settings (
@@ -146,8 +177,45 @@ def connect() -> sqlite3.Connection:
         "CREATE INDEX IF NOT EXISTS idx_events_user_event "
         "ON funnel_events(user_id, event)"
     )
+    for column, event in [('lesson_received_at', 'lesson_video_sent'),
+                          ('lesson_completed_at', 'lesson_completed'),
+                          ('questionnaire_started_at', 'questionnaire_started')]:
+        if column not in existing:
+            db.execute(f'''UPDATE users SET {column}=(SELECT MIN(created_at) FROM funnel_events
+                WHERE user_id=users.telegram_id AND event=?)''', (event,))
     db.commit()
     return db
+
+
+class SQLiteStorage(BaseStorage):
+    """Keep questionnaire state on the same persistent volume as the funnel."""
+    @staticmethod
+    def key_string(key: StorageKey) -> str:
+        return json.dumps(asdict(key), sort_keys=True)
+
+    async def set_state(self, key, state=None):
+        value = state.state if isinstance(state, State) else state
+        with connect() as db:
+            db.execute("INSERT INTO form_state(key,state) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET state=excluded.state",
+                       (self.key_string(key), value))
+
+    async def get_state(self, key):
+        with connect() as db:
+            row = db.execute('SELECT state FROM form_state WHERE key=?', (self.key_string(key),)).fetchone()
+            return row['state'] if row else None
+
+    async def set_data(self, key, data):
+        with connect() as db:
+            db.execute("INSERT INTO form_state(key,data) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET data=excluded.data",
+                       (self.key_string(key), json.dumps(dict(data), ensure_ascii=False)))
+
+    async def get_data(self, key):
+        with connect() as db:
+            row = db.execute('SELECT data FROM form_state WHERE key=?', (self.key_string(key),)).fetchone()
+            return json.loads(row['data']) if row else {}
+
+    async def close(self):
+        pass
 
 
 def record_event(user_id: int, event: str, details: str | None = None) -> None:
@@ -156,6 +224,10 @@ def record_event(user_id: int, event: str, details: str | None = None) -> None:
             "INSERT INTO funnel_events (user_id, event, details, created_at) VALUES (?, ?, ?, ?)",
             (user_id, event, details, now_iso()),
         )
+        column = {'lesson_video_sent': 'lesson_received_at', 'lesson_completed': 'lesson_completed_at',
+                  'questionnaire_started': 'questionnaire_started_at'}.get(event)
+        if column:
+            db.execute(f'UPDATE users SET {column}=COALESCE({column},?) WHERE telegram_id=?', (now_iso(), user_id))
         db.commit()
 
 
@@ -206,6 +278,8 @@ def update_user(user_id: int, **values: object) -> None:
         "recommendation",
         "recommendation_reason",
         "contact",
+        "lead_status",
+        "reminders_enabled",
     }
     clean = {key: value for key, value in values.items() if key in allowed}
     if not clean:
@@ -213,6 +287,14 @@ def update_user(user_id: int, **values: object) -> None:
     clean["updated_at"] = now_iso()
     fields = ", ".join(f"{key}=?" for key in clean)
     with connect() as db:
+        if 'stage' in clean:
+            row = db.execute('SELECT stage FROM users WHERE telegram_id=?', (user_id,)).fetchone()
+            ranks = {'started': 0, 'subscription_required': 1, 'lesson_opened': 2,
+                     'lesson_video_sent': 3, 'lesson_completed': 4, 'questionnaire_started': 5,
+                     'recommendation_shown': 6, 'contact_requested': 7, 'application_completed': 8}
+            if row and ranks.get(clean['stage'], 0) < ranks.get(row['stage'], 0):
+                clean.pop('stage')
+            fields = ', '.join(f'{key}=?' for key in clean)
         db.execute(
             f"UPDATE users SET {fields} WHERE telegram_id=?",
             (*clean.values(), user_id),
@@ -300,12 +382,109 @@ def cancel_pending_funnel(user_id: int) -> None:
         db.commit()
 
 
+def schedule_form_reminder(user_id: int) -> None:
+    due = (utc_now() + timedelta(hours=FORM_REMINDER_HOURS)).isoformat()
+    with connect() as db:
+        db.execute("""INSERT INTO scheduled_messages(user_id,kind,due_at,created_at)
+            VALUES(?,'form_reminder',?,?) ON CONFLICT(user_id,kind) DO UPDATE SET
+            due_at=excluded.due_at,sent_at=NULL,canceled_at=NULL,attempts=0,last_error=NULL""",
+                   (user_id, due, now_iso()))
+
+
+LEAD_STATUSES = {'new': '🆕 Нові', 'work': '🛠 В роботі', 'done': '✅ Опрацьовані', 'all': '📋 Усі заявки', 'people': '👥 Усі в боті'}
+STAGE_LABELS = {'started': 'Запустив бота', 'subscription_required': 'Очікує підписки',
+    'lesson_opened': 'Відкрив картку уроку', 'lesson_video_sent': 'Отримав урок',
+    'lesson_completed': 'Позначив урок переглянутим', 'questionnaire_started': 'Заповнює анкету',
+    'recommendation_shown': 'Отримав рекомендацію', 'contact_requested': 'Залишає контакт',
+    'application_completed': 'Заявка збережена'}
+TARIFF_NAMES = {'BASIC': 'Базовий', 'GROUP': 'Груповий', 'MASTER': 'P2P MASTER'}
+
+
+def lead_buttons(user_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text='💬 Відкрити користувача', url=f'tg://user?id={user_id}')],
+        [InlineKeyboardButton(text='🛠 В роботі', callback_data=f'adminlead:status:{user_id}:work'),
+         InlineKeyboardButton(text='✅ Опрацьовано', callback_data=f'adminlead:status:{user_id}:done')],
+        [InlineKeyboardButton(text='📋 Список заявок', callback_data='adminlead:list:new:0')]])
+
+
+def store_application(user_id: int, contact: str, text: str) -> None:
+    """Commit the accepted lead and its notification together before acknowledging it."""
+    now = now_iso()
+    with connect() as db:
+        db.execute("UPDATE users SET stage='application_completed',contact=?,lead_status='new',updated_at=? WHERE telegram_id=?",
+                   (contact, now, user_id))
+        db.execute('UPDATE scheduled_messages SET canceled_at=? WHERE user_id=? AND sent_at IS NULL AND canceled_at IS NULL', (now, user_id))
+        db.execute('INSERT INTO funnel_events(user_id,event,created_at) VALUES(?,\'application_completed\',?)', (user_id, now))
+        db.execute("""INSERT INTO lead_notifications(user_id,text,due_at) VALUES(?,?,?)
+            ON CONFLICT(user_id) DO UPDATE SET text=excluded.text,due_at=excluded.due_at,
+            sent_at=NULL,attempts=0,last_error=NULL""", (user_id, text, now))
+
+
+async def deliver_lead_notifications(bot: Bot) -> None:
+    async with notification_lock:
+        with connect() as db:
+            rows = db.execute('SELECT * FROM lead_notifications WHERE sent_at IS NULL AND due_at<=? ORDER BY due_at LIMIT 10', (now_iso(),)).fetchall()
+        for row in rows:
+            try:
+                await bot.send_message(ADMIN_CHAT_ID, row['text'], reply_markup=lead_buttons(row['user_id']))
+            except Exception as exc:
+                logging.exception('Lead notification delayed for %s', row['user_id'])
+                delay = min(60, 2 ** min(row['attempts'], 6))
+                due = (utc_now() + timedelta(minutes=delay)).isoformat()
+                with connect() as db:
+                    db.execute('UPDATE lead_notifications SET attempts=attempts+1,due_at=?,last_error=? WHERE user_id=?',
+                               (due, str(exc)[:500], row['user_id']))
+            else:
+                with connect() as db:
+                    db.execute('UPDATE lead_notifications SET sent_at=?,last_error=NULL WHERE user_id=?', (now_iso(), row['user_id']))
+
+
+async def show_leads(message: Message, status: str = 'new', page: int = 0, edit: bool = False) -> None:
+    if status not in LEAD_STATUSES or page < 0:
+        return
+    condition = '1=1' if status == 'people' else 'contact IS NOT NULL'
+    params = []
+    if status in {'new', 'work', 'done'}:
+        condition += ' AND lead_status=?'
+        params.append(status)
+    with connect() as db:
+        count = db.execute(f'SELECT COUNT(*) FROM users WHERE {condition}', params).fetchone()[0]
+        page = min(page, max(0, (count - 1) // 8))
+        rows = db.execute(f'SELECT * FROM users WHERE {condition} ORDER BY updated_at DESC,telegram_id LIMIT 8 OFFSET ?', (*params, page*8)).fetchall()
+    text = f'<b>{LEAD_STATUSES[status]}</b> · {count}\nСторінка {page + 1}\n\n'
+    keyboard = []
+    for row in rows:
+        name = row['first_name'] or row['username'] or str(row['telegram_id'])
+        label = TARIFF_NAMES.get(row['recommendation']) or STAGE_LABELS.get(row['stage'], 'У боті')
+        text += f"• {html.escape(name)} · {html.escape(label)}\n"
+        keyboard.append([InlineKeyboardButton(text=f'{name[:40]} · {label}', callback_data=f'adminlead:detail:{row["telegram_id"]}')])
+    if not rows:
+        text += 'У цьому списку поки нікого немає.'
+    nav = []
+    if page: nav.append(InlineKeyboardButton(text='⬅️', callback_data=f'adminlead:list:{status}:{page-1}'))
+    if (page+1)*8 < count: nav.append(InlineKeyboardButton(text='➡️', callback_data=f'adminlead:list:{status}:{page+1}'))
+    if nav: keyboard.append(nav)
+    for key in ('new', 'work', 'done', 'all', 'people'):
+        keyboard.append([InlineKeyboardButton(text=LEAD_STATUSES[key], callback_data=f'adminlead:list:{key}:0')])
+    if edit:
+        try:
+            await message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+        except TelegramBadRequest as error:
+            if 'message is not modified' not in str(error).lower():
+                raise
+    else:
+        await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard))
+
+
 def main_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🎁 Отримати безкоштовний урок", callback_data="lesson")],
             [InlineKeyboardButton(text="📚 Програма навчання", callback_data="program")],
             [InlineKeyboardButton(text="💎 Тарифи", callback_data="tariffs")],
+            [InlineKeyboardButton(text="📝 Продовжити / пройти анкету", callback_data="resume_form")],
+            [InlineKeyboardButton(text="🔕 Вимкнути нагадування", callback_data="stop_reminders")],
             [InlineKeyboardButton(text="👨‍💻 Написати Михайлу", url=CONTACT_URL)],
         ]
     )
@@ -324,7 +503,6 @@ def lesson_menu() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="▶️ Переглянути безкоштовний урок", callback_data="watch_lesson")],
-            [InlineKeyboardButton(text="✅ Я переглянув урок", callback_data="lesson_done")],
             [InlineKeyboardButton(text="🏠 Головне меню", callback_data="menu")],
         ]
     )
@@ -380,14 +558,15 @@ def contact_keyboard() -> ReplyKeyboardMarkup:
 
 async def subscribed(bot: Bot, user_id: int) -> bool:
     if not CHANNEL_ID:
-        return True
+        logging.error('CHANNEL_ID is missing; subscription cannot be verified')
+        return False
     try:
         member = await bot.get_chat_member(CHANNEL_ID, user_id)
         return member.status in {
             ChatMemberStatus.MEMBER,
             ChatMemberStatus.ADMINISTRATOR,
             ChatMemberStatus.CREATOR,
-        }
+        } or (member.status == ChatMemberStatus.RESTRICTED and bool(getattr(member, 'is_member', False)))
     except Exception:
         logging.exception("Subscription check failed for %s", user_id)
         return False
@@ -451,9 +630,11 @@ async def send_lesson_video(message: Message) -> None:
                 ]
             ),
         )
+        update_user(message.chat.id, stage='lesson_video_sent')
+        record_event(message.chat.id, 'lesson_video_sent', 'fallback_link_issued')
         return
     await message.answer(
-        "🎬 Відео ще готується до публікації. Бот повідомить, щойно воно буде доступне.",
+        "🎬 Відео ще готується до публікації. Спробуй відкрити урок пізніше або напиши Михайлу.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="👨‍💻 Написати Михайлу", url=CONTACT_URL)],
@@ -587,7 +768,6 @@ async def send_recommendation(message: Message, data: dict[str, str]) -> None:
 
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
-    await state.clear()
     payload = "direct"
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) == 2:
@@ -628,7 +808,6 @@ async def support_command(message: Message) -> None:
 
 @router.callback_query(F.data == "menu")
 async def menu_callback(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
     await callback.answer()
     await show_menu(callback.message)
 
@@ -665,6 +844,12 @@ async def watch_lesson(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "lesson_done")
 async def lesson_done(callback: CallbackQuery) -> None:
+    user = get_user(callback.from_user.id)
+    with connect() as db:
+        issued = db.execute("SELECT 1 FROM funnel_events WHERE user_id=? AND event='lesson_video_sent' LIMIT 1", (callback.from_user.id,)).fetchone()
+    if not user or not (user['lesson_received_at'] or issued):
+        await callback.answer('Спочатку відкрий відеоурок кнопкою перегляду.', show_alert=True)
+        return
     update_user(callback.from_user.id, stage="lesson_completed")
     record_event(callback.from_user.id, "lesson_completed")
     await callback.answer("Урок відмічено як переглянутий ✅")
@@ -691,10 +876,15 @@ async def tariffs_callback(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "apply")
 async def apply_start(callback: CallbackQuery, state: FSMContext) -> None:
+    if await state.get_state():
+        await callback.answer()
+        await ask_form_step(callback.message, await state.get_state())
+        return
     await state.clear()
     await state.set_state(LeadForm.experience)
     update_user(callback.from_user.id, stage="questionnaire_started")
     record_event(callback.from_user.id, "questionnaire_started")
+    schedule_form_reminder(callback.from_user.id)
     await callback.answer()
     await callback.message.answer(
         "<b>1/4. Який у тебе досвід у P2P?</b>",
@@ -708,11 +898,123 @@ async def apply_start(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
 
+FORM_STEPS = {
+    'LeadForm:experience': ('1/4. Який у тебе досвід у P2P?', [('Новачок', 'exp:new'), ('Були перші угоди', 'exp:first'), ('Уже працюю', 'exp:active')]),
+    'LeadForm:capital': ('2/4. Який капітал плануєш використовувати для практики?', [('До $200', 'cap:200'), ('$200–500', 'cap:500'), ('$500–1 500', 'cap:1500'), ('Понад $1 500', 'cap:more')]),
+    'LeadForm:goal': ('3/4. Яка твоя головна ціль?', [('Стартувати з нуля', 'goal:start'), ('Побудувати стабільну систему', 'goal:system'), ('Збільшити обороти', 'goal:scale')]),
+    'LeadForm:support': ('4/4. Який рівень підтримки тобі потрібний?', [('Навчатися самостійно', 'sup:self'), ('Група + підтримка ментора', 'sup:group'), ('Максимальний супровід', 'sup:personal')]),
+}
+
+
+async def ask_form_step(message: Message, step: str) -> None:
+    if step == LeadForm.contact.state:
+        await message.answer('Залиш власний номер телефону або натисни «Використати мій Telegram».', reply_markup=contact_keyboard())
+    elif step in FORM_STEPS:
+        title, choices = FORM_STEPS[step]
+        await message.answer(f'<b>{title}</b>', reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text=label, callback_data=data)] for label, data in choices]))
+
+
+@router.callback_query(F.data == 'resume_form')
+async def resume_form(callback: CallbackQuery, state: FSMContext) -> None:
+    step = await state.get_state()
+    if step:
+        await callback.answer('Продовжуємо з місця, де зупинились')
+        await ask_form_step(callback.message, step)
+    else:
+        user = get_user(callback.from_user.id)
+        if user and user['stage'] == 'application_completed':
+            await callback.answer('Твоя заявка вже збережена ✅', show_alert=True)
+        elif user and user['recommendation']:
+            await contact_start(callback, state)
+        else:
+            await apply_start(callback, state)
+
+
+@router.callback_query(F.data == 'stop_reminders')
+async def stop_reminders(callback: CallbackQuery) -> None:
+    update_user(callback.from_user.id, reminders_enabled=0)
+    cancel_pending_funnel(callback.from_user.id)
+    await callback.answer('Нагадування вимкнено')
+    await callback.message.answer('🔕 Автоматичні нагадування вимкнено. Урок, анкета та меню залишаються доступними.')
+
+
+@router.callback_query(F.data.startswith('adminlead:'))
+async def admin_lead_callback(callback: CallbackQuery) -> None:
+    if callback.from_user.id != ADMIN_CHAT_ID:
+        await callback.answer('Доступ лише для адміністратора', show_alert=True)
+        return
+    await callback.answer()
+    parts = (callback.data or '').split(':')
+    try:
+        if len(parts) == 4 and parts[1] == 'list':
+            await show_leads(callback.message, parts[2], int(parts[3]), edit=True)
+        elif len(parts) in {3, 4} and parts[1] in {'detail', 'status'}:
+            uid = int(parts[2])
+            if parts[1] == 'status':
+                if len(parts) != 4 or parts[3] not in {'new', 'work', 'done'}: return
+                update_user(uid, lead_status=parts[3])
+            user = get_user(uid)
+            if not user: return
+            status = LEAD_STATUSES.get(user['lead_status'], '🆕 Нові')
+            text = f'<b>Клієнт №{uid}</b> · {status}\n\n'
+            labels = [('first_name', 'Ім’я'), ('username', 'Нік'), ('source', 'Джерело'),
+                      ('experience', 'Досвід'), ('capital', 'Капітал'), ('goal', 'Ціль'),
+                      ('support', 'Підтримка'), ('recommendation', 'Рекомендація'), ('contact', 'Контакт'), ('stage', 'Етап')]
+            for key, label in labels:
+                value = user[key] or '—'
+                if key == 'stage': value = STAGE_LABELS.get(value, value)
+                if key == 'recommendation': value = TARIFF_NAMES.get(value, value)
+                text += f'{label}: {html.escape(str(value))}\n'
+            try:
+                await callback.message.edit_text(text, reply_markup=lead_buttons(uid))
+            except TelegramBadRequest as error:
+                if 'message is not modified' not in str(error).lower():
+                    raise
+    except (ValueError, IndexError):
+        return
+
+
+@router.message(Command('leads'))
+async def leads(message: Message) -> None:
+    if message.from_user.id == ADMIN_CHAT_ID:
+        await show_leads(message)
+
+
+@router.message(Command('people'))
+async def people(message: Message) -> None:
+    if message.from_user.id == ADMIN_CHAT_ID:
+        await show_leads(message, 'people')
+
+
+def is_channel_member(member) -> bool:
+    return member.status in {ChatMemberStatus.MEMBER, ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.CREATOR} or (
+        member.status == ChatMemberStatus.RESTRICTED and bool(getattr(member, 'is_member', False)))
+
+
+@router.chat_member()
+async def track_channel_join(event: ChatMemberUpdated) -> None:
+    if CHANNEL_ID not in {str(event.chat.id), '@' + (event.chat.username or '')}:
+        return
+    if is_channel_member(event.old_chat_member) or not is_channel_member(event.new_chat_member):
+        return
+    user = event.new_chat_member.user
+    if user.is_bot: return
+    invite = event.invite_link.invite_link if event.invite_link else ''
+    via_link = int(bool(invite) and invite.rstrip('/') == CHANNEL_URL.rstrip('/'))
+    stamp = event.date.isoformat()
+    with connect() as db:
+        db.execute('''INSERT INTO channel_joins(user_id,first_joined_at,last_joined_at,via_bot_link)
+            VALUES(?,?,?,?) ON CONFLICT(user_id) DO UPDATE SET last_joined_at=excluded.last_joined_at,
+            via_bot_link=MAX(channel_joins.via_bot_link,excluded.via_bot_link)''', (user.id, stamp, stamp, via_link))
+
+
 @router.callback_query(LeadForm.experience, F.data.startswith("exp:"))
 async def apply_experience(callback: CallbackQuery, state: FSMContext) -> None:
     code = callback.data.split(":", 1)[1]
     values = {"new": "Новачок", "first": "Були перші угоди", "active": "Уже працюю"}
     await state.update_data(experience=values.get(code, "Новачок"), experience_code=code)
+    update_user(callback.from_user.id, experience=values.get(code, 'Новачок'))
     await state.set_state(LeadForm.capital)
     await callback.answer()
     await callback.message.answer(
@@ -738,6 +1040,7 @@ async def apply_capital(callback: CallbackQuery, state: FSMContext) -> None:
         "more": "Понад $1 500",
     }
     await state.update_data(capital=values.get(code, "До $200"), capital_code=code)
+    update_user(callback.from_user.id, capital=values.get(code, 'До $200'))
     await state.set_state(LeadForm.goal)
     await callback.answer()
     await callback.message.answer(
@@ -761,6 +1064,7 @@ async def apply_goal(callback: CallbackQuery, state: FSMContext) -> None:
         "scale": "Збільшити обороти",
     }
     await state.update_data(goal=values.get(code, "Стартувати з нуля"), goal_code=code)
+    update_user(callback.from_user.id, goal=values.get(code, 'Стартувати з нуля'))
     await state.set_state(LeadForm.support)
     await callback.answer()
     await callback.message.answer(
@@ -784,6 +1088,7 @@ async def apply_support(callback: CallbackQuery, state: FSMContext) -> None:
         "personal": "Максимальний супровід",
     }
     await state.update_data(support=values.get(code, "Навчатися самостійно"), support_code=code)
+    update_user(callback.from_user.id, support=values.get(code, 'Навчатися самостійно'))
     data = await state.get_data()
     await state.clear()
     await callback.answer("Рекомендацію сформовано ✅")
@@ -819,7 +1124,7 @@ async def contact_start(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(LeadForm.contact)
     update_user(callback.from_user.id, stage="contact_requested")
     await callback.answer()
-    username_hint = f"@{callback.from_user.username}" if callback.from_user.username else "Telegram-профіль"
+    username_hint = html.escape(f"@{callback.from_user.username}") if callback.from_user.username else "Telegram-профіль"
     await callback.message.answer(
         "Залиш номер телефону або натисни «Використати мій Telegram».\n\n"
         f"Після цього Михайло перегляне відповіді та напише тобі. Поточний контакт: {username_hint}",
@@ -827,9 +1132,12 @@ async def contact_start(callback: CallbackQuery, state: FSMContext) -> None:
     )
 
 
-@router.message(LeadForm.contact)
+@router.message(LeadForm.contact, ~F.text.startswith('/'))
 async def apply_contact(message: Message, state: FSMContext) -> None:
     if message.contact and message.contact.phone_number:
+        if message.contact.user_id != message.from_user.id:
+            await message.answer('Поділися власним номером кнопкою або використай свій Telegram.')
+            return
         contact = message.contact.phone_number
     elif (message.text or "").strip() == "Використати мій Telegram":
         contact = f"@{message.from_user.username}" if message.from_user.username else f"Telegram ID {message.from_user.id}"
@@ -840,10 +1148,6 @@ async def apply_contact(message: Message, state: FSMContext) -> None:
         return
 
     user = get_user(message.from_user.id)
-    update_user(message.from_user.id, stage="application_completed", contact=contact)
-    cancel_pending_funnel(message.from_user.id)
-    record_event(message.from_user.id, "application_completed")
-    user = get_user(message.from_user.id) or user
     username = f"@{message.from_user.username}" if message.from_user.username else "немає"
     admin_text = (
         "🔥 <b>Нова заявка з безкоштовного уроку</b>\n\n"
@@ -858,18 +1162,7 @@ async def apply_contact(message: Message, state: FSMContext) -> None:
         f"Рекомендація: {html.escape((user['recommendation'] if user else None) or '—')}\n"
         f"Контакт: {html.escape(contact)}"
     )
-    try:
-        await message.bot.send_message(
-            ADMIN_CHAT_ID,
-            admin_text,
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="💬 Відкрити користувача", url=f"tg://user?id={message.from_user.id}")]
-                ]
-            ),
-        )
-    except Exception:
-        logging.exception("Failed to notify admin")
+    store_application(message.from_user.id, contact, admin_text)
     await state.clear()
     await message.answer(
         "✅ <b>Заявку прийнято.</b>\n\n"
@@ -886,6 +1179,7 @@ async def apply_contact(message: Message, state: FSMContext) -> None:
             ]
         ),
     )
+    await deliver_lead_notifications(message.bot)
 
 
 @router.message(Command("set_lesson_video"))
@@ -946,11 +1240,15 @@ async def reset_funnel(message: Message, state: FSMContext) -> None:
             """
             UPDATE users SET stage='started', experience=NULL, capital=NULL, goal=NULL,
                 support=NULL, recommendation=NULL, recommendation_reason=NULL, contact=NULL,
+                lesson_received_at=NULL,lesson_completed_at=NULL,questionnaire_started_at=NULL,
+                reminders_enabled=1,lead_status='new',
                 updated_at=? WHERE telegram_id=?
             """,
             (now_iso(), message.from_user.id),
         )
         db.execute("DELETE FROM scheduled_messages WHERE user_id=?", (message.from_user.id,))
+        db.execute("DELETE FROM lead_notifications WHERE user_id=?", (message.from_user.id,))
+        db.execute("DELETE FROM funnel_events WHERE user_id=?", (message.from_user.id,))
         db.commit()
     await message.answer("✅ Твій тестовий шлях очищено. Тепер надішли /start")
 
@@ -983,15 +1281,30 @@ async def stats(message: Message) -> None:
         pending = db.execute(
             "SELECT COUNT(*) FROM scheduled_messages WHERE sent_at IS NULL AND canceled_at IS NULL"
         ).fetchone()[0]
+        incomplete = db.execute("SELECT COUNT(*) FROM users WHERE questionnaire_started_at IS NOT NULL AND contact IS NULL").fetchone()[0]
+        new_leads = db.execute("SELECT COUNT(*) FROM users WHERE contact IS NOT NULL AND lead_status='new'").fetchone()[0]
+        undelivered = db.execute('SELECT COUNT(*) FROM lead_notifications WHERE sent_at IS NULL').fetchone()[0]
+        joins = db.execute('SELECT COUNT(*),COALESCE(SUM(via_bot_link),0) FROM channel_joins').fetchone()
+        sources = db.execute('''SELECT source,COUNT(*) AS total,SUM(contact IS NOT NULL) AS leads
+            FROM users GROUP BY source ORDER BY total DESC LIMIT 10''').fetchall()
     await message.answer(
         "📊 <b>Статистика воронки</b>\n\n"
         f"Користувачів: {total}\n"
         f"Підписку підтверджено: {subscribed_count}\n"
-        f"Відео відкрили: {videos}\n"
+        f"Урок отримали (відео / посилання): {videos}\n"
         f"Урок позначили переглянутим: {lessons}\n"
         f"Отримали рекомендацію: {recommendations}\n"
         f"Залишили заявку: {leads}\n"
-        f"Запланованих повідомлень: {pending}"
+        f"Незавершених анкет без контакту: {incomplete}\n"
+        f"Нових заявок до опрацювання: {new_leads}\n"
+        f"Заявок очікують доставки тобі: {undelivered}\n"
+        f"Нових вступів у канал від запуску обліку: {joins[0]}\n"
+        f"Із них за посиланням із бота: {joins[1]}\n"
+        f"Запланованих повідомлень: {pending}\n\n"
+        '<b>Джерела: користувачі / заявки</b>\n' + '\n'.join(
+            f"{html.escape(row['source'])}: {row['total']} / {row['leads']}" for row in sources) +
+        '\n\n/leads — заявки зі статусами\n/people — усі користувачі бота\n'
+        'Підтвердження підписки не означає новий вступ. Історичні вступи не враховані.'
     )
 
 
@@ -999,6 +1312,8 @@ def should_skip_scheduled(kind: str, user: sqlite3.Row | None) -> bool:
     if not user:
         return True
     stage = user["stage"] or "started"
+    if 'reminders_enabled' in user.keys() and not user['reminders_enabled']:
+        return True
     if stage == "application_completed":
         return True
     if kind == "lesson_reminder" and stage in {
@@ -1008,7 +1323,8 @@ def should_skip_scheduled(kind: str, user: sqlite3.Row | None) -> bool:
         "contact_requested",
     }:
         return True
-    if kind in {"tariff_offer", "final_cta"} and stage in {
+    if kind in {"tariff_offer", "final_cta", "value_case"} and stage in {
+        "questionnaire_started",
         "recommendation_shown",
         "contact_requested",
     }:
@@ -1017,7 +1333,16 @@ def should_skip_scheduled(kind: str, user: sqlite3.Row | None) -> bool:
 
 
 async def send_scheduled_message(bot: Bot, kind: str, user_id: int, user: sqlite3.Row) -> None:
-    if kind == "lesson_reminder":
+    if kind == 'form_reminder':
+        text = ('📝 <b>Залишився останній крок — твій контакт.</b>\n\n'
+                'Рекомендація вже готова. Залиш контакт, щоб Михайло міг обговорити з тобою навчання.'
+                if user['recommendation'] else
+                '📝 <b>Ти почав підбирати формат навчання.</b>\n\n'
+                'Продовж анкету з місця, де зупинився. Відповіді збережені — повторювати їх не потрібно.')
+        await bot.send_message(user_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text='📝 Продовжити анкету', callback_data='resume_form')],
+            [InlineKeyboardButton(text='🔕 Вимкнути нагадування', callback_data='stop_reminders')]]))
+    elif kind == "lesson_reminder":
         if not user["subscribed"]:
             await bot.send_message(
                 user_id,
@@ -1076,6 +1401,7 @@ async def send_scheduled_message(bot: Bot, kind: str, user_id: int, user: sqlite
 async def funnel_worker(bot: Bot) -> None:
     while True:
         try:
+            await deliver_lead_notifications(bot)
             with connect() as db:
                 rows = db.execute(
                     """
@@ -1134,14 +1460,21 @@ async def funnel_worker(bot: Bot) -> None:
 
 async def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    for name, value in [('CHANNEL_URL', CHANNEL_URL), ('SITE_URL', SITE_URL),
+                        ('CONTACT_URL', CONTACT_URL), ('LESSON_URL', LESSON_URL)]:
+        if name == 'LESSON_URL' and not value:
+            continue
+        parsed = urlparse(value)
+        if parsed.scheme not in {'http', 'https'} or not parsed.hostname or any(c.isspace() for c in value):
+            raise RuntimeError(f'{name}: expected an http(s) URL without spaces')
     connect().close()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
-    dp = Dispatcher(storage=MemoryStorage())
+    dp = Dispatcher(storage=SQLiteStorage(), events_isolation=SimpleEventIsolation())
     dp.include_router(router)
     await bot.delete_webhook(drop_pending_updates=False)
     worker = asyncio.create_task(funnel_worker(bot))
     try:
-        await dp.start_polling(bot)
+        await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
     finally:
         worker.cancel()
         with suppress(asyncio.CancelledError):
