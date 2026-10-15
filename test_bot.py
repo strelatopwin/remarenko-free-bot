@@ -274,18 +274,27 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
         with bot.connect() as db:
             self.assertEqual(db.execute('SELECT COUNT(*) FROM scheduled_messages WHERE user_id=50 AND canceled_at IS NULL AND sent_at IS NULL').fetchone()[0],0)
 
-    async def test_optout_persists_on_deploy_and_progress_and_explicit_optin(self):
+    async def test_retired_button_restores_disabled_users_once_and_old_callback_cannot_stop(self):
+        with bot.connect() as db:
+            db.execute("DELETE FROM settings WHERE key='reminder_controls_removed_216'")
         bot.update_user(50,reminders_enabled=0)
         bot.update_user(50,stage='questionnaire_started',experience='Новачок')
         bot.initialize_stage_reminders()
         callback=SimpleNamespace(from_user=SimpleNamespace(id=50),answer=AsyncMock(),message=SimpleNamespace(answer=AsyncMock()))
         with bot.connect() as db:
-            self.assertEqual(db.execute('SELECT COUNT(*) FROM scheduled_messages WHERE user_id=50 AND canceled_at IS NULL').fetchone()[0],0)
-        await bot.enable_reminders(callback)
-        with bot.connect() as db:
             before=[tuple(r) for r in db.execute('SELECT kind,due_at FROM scheduled_messages WHERE user_id=50 AND canceled_at IS NULL')]
         self.assertEqual(len(before),5)
-        await bot.enable_reminders(callback)
+        self.assertEqual(bot.get_user(50)['reminders_enabled'],1)
+        await bot.stop_reminders(callback)
+        self.assertEqual(bot.get_user(50)['reminders_enabled'],1)
+        self.assertFalse(any(b.callback_data in {'stop_reminders','enable_reminders'} for row in bot.main_menu(50).inline_keyboard for b in row))
+        with bot.connect() as db:
+            row=db.execute('SELECT kind FROM scheduled_messages WHERE user_id=50 AND canceled_at IS NULL LIMIT 1').fetchone()
+        api=SimpleNamespace(send_message=AsyncMock())
+        self.assertTrue(await bot.send_scheduled_message(api,row['kind'],50,bot.get_user(50)))
+        buttons=[button.callback_data for line in api.send_message.call_args.kwargs['reply_markup'].inline_keyboard for button in line]
+        self.assertNotIn('stop_reminders',buttons)
+        bot.initialize_stage_reminders()
         with bot.connect() as db:
             after=[tuple(r) for r in db.execute('SELECT kind,due_at FROM scheduled_messages WHERE user_id=50 AND canceled_at IS NULL')]
         self.assertEqual(before,after)

@@ -39,7 +39,7 @@ from aiogram.types import (
 )
 
 
-BOT_VERSION = "2.1.5"
+BOT_VERSION = "2.1.6"
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "788167958"))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/remarenko_free.sqlite3")
@@ -252,7 +252,7 @@ def save_user(message: Message, source: str = "direct") -> bool:
     now = now_iso()
     with connect() as db:
         exists = db.execute(
-            "SELECT 1 FROM users WHERE telegram_id=?", (message.from_user.id,)
+            "SELECT reminders_enabled FROM users WHERE telegram_id=?", (message.from_user.id,)
         ).fetchone()
         db.execute(
             """
@@ -262,6 +262,7 @@ def save_user(message: Message, source: str = "direct") -> bool:
                 username=excluded.username,
                 first_name=excluded.first_name,
                 source=CASE WHEN users.source='direct' THEN excluded.source ELSE users.source END,
+                reminders_enabled=1,
                 updated_at=excluded.updated_at
             """,
             (
@@ -273,7 +274,7 @@ def save_user(message: Message, source: str = "direct") -> bool:
                 now,
             ),
         )
-        sync_stage_reminders(db,message.from_user.id)
+        sync_stage_reminders(db,message.from_user.id,force=bool(exists and not exists['reminders_enabled']))
         db.commit()
     if not exists:
         record_event(message.from_user.id, "started", source or "direct")
@@ -406,6 +407,15 @@ def schedule_form_reminder(user_id: int) -> None:
 def initialize_stage_reminders():
     """One-time migration per person. Future deployments preserve due times and sent flags."""
     with connect() as db:
+        migrated=db.execute("SELECT 1 FROM settings WHERE key='reminder_controls_removed_216'").fetchone()
+        if not migrated:
+            # Restore schedules previously disabled with the retired user-facing button.
+            disabled=[row['telegram_id'] for row in db.execute('SELECT telegram_id FROM users WHERE reminders_enabled=0')]
+            db.execute('UPDATE users SET reminders_enabled=1 WHERE reminders_enabled=0')
+            for user_id in disabled:
+                sync_stage_reminders(db,user_id,force=True)
+            db.execute('INSERT INTO settings(key,value,updated_at) VALUES(?,?,?)',
+                       ('reminder_controls_removed_216','1',now_iso()))
         # Disable superseded 2.1.4 timer types to prevent overlapping campaigns.
         db.execute("UPDATE scheduled_messages SET canceled_at=? WHERE kind NOT LIKE 'stage:%' AND sent_at IS NULL AND canceled_at IS NULL",(now_iso(),))
         for row in db.execute('SELECT telegram_id FROM users').fetchall():
@@ -677,16 +687,12 @@ def excel_bytes(rows):
 
 
 def main_menu(user_id: int | None = None) -> InlineKeyboardMarkup:
-    user=get_user(user_id) if user_id is not None else None
-    enabled=not user or bool(user['reminders_enabled'])
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🎁 Отримати безкоштовний урок", callback_data="lesson")],
             [InlineKeyboardButton(text="📚 Програма навчання", callback_data="program")],
             [InlineKeyboardButton(text="💎 Тарифи", callback_data="tariffs")],
             [InlineKeyboardButton(text="📝 Продовжити / пройти анкету", callback_data="resume_form")],
-            [InlineKeyboardButton(text="🔕 Вимкнути нагадування" if enabled else "🔔 Увімкнути нагадування",
-                                  callback_data="stop_reminders" if enabled else "enable_reminders")],
             [InlineKeyboardButton(text="👨‍💻 Написати Михайлу", url=CONTACT_URL)],
         ]
     )
@@ -1299,10 +1305,11 @@ async def resume_form(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == 'stop_reminders')
 async def stop_reminders(callback: CallbackQuery) -> None:
-    update_user(callback.from_user.id, reminders_enabled=0)
-    cancel_pending_funnel(callback.from_user.id)
-    await callback.answer('Нагадування вимкнено')
-    await callback.message.answer('🔕 Автоматичні нагадування вимкнено. Урок, анкета та меню залишаються доступними.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔔 Увімкнути нагадування',callback_data='enable_reminders')]]))
+    # Old Telegram messages can retain this button after the deployment.
+    user=get_user(callback.from_user.id)
+    if user and not user['reminders_enabled']:
+        update_user(callback.from_user.id,reminders_enabled=1)
+    await callback.answer('Нагадування залишаються активними',show_alert=True)
 
 
 @router.callback_query(F.data.startswith('adminlead:'))
@@ -1816,7 +1823,6 @@ async def send_scheduled_message(bot: Bot, kind: str, user_id: int, user: sqlite
         }.get(step,('resume_form','📝 Продовжити анкету'))
         rows=[[InlineKeyboardButton(text=label,callback_data=action)]]
         if step=='watch': rows.append([InlineKeyboardButton(text='✅ Я переглянув урок',callback_data='lesson_done')])
-    rows.append([InlineKeyboardButton(text='🔕 Вимкнути нагадування',callback_data='stop_reminders')])
     await bot.send_message(user_id,text,reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
     return True
 
