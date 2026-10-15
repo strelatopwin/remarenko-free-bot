@@ -39,7 +39,7 @@ from aiogram.types import (
 )
 
 
-BOT_VERSION = "2.1.6"
+BOT_VERSION = "2.1.7"
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "788167958"))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/remarenko_free.sqlite3")
@@ -340,6 +340,7 @@ REMINDER_STEP_LABELS = {
     'welcome': 'Запустив бота — не відкрив урок',
     'subscribe': 'Не підтвердив підписку',
     'open_lesson': 'Не отримав відео',
+    'lesson_ready': 'Анкету завершено, чекає на відео',
     'watch': 'Не позначив урок переглянутим',
     'form_start': 'Не почав анкету',
     'form_exp': 'Анкета 1/4 — досвід',
@@ -355,14 +356,15 @@ REMINDER_STEP_LABELS = {
 def reminder_step(user):
     if user['contact'] or user['stage']=='application_completed': return 'completed'
     if user['stage']=='contact_requested': return 'contact'
-    if user['recommendation']: return 'offer'
+    if user['recommendation']:
+        return 'offer' if user['lesson_received_at'] else 'lesson_ready'
     if user['stage']=='questionnaire_started' or user['questionnaire_started_at']:
         for field,step in [('experience','form_exp'),('capital','form_cap'),('goal','form_goal'),('support','form_support')]:
             if not user[field]: return step
         return 'form_support'
     if user['lesson_completed_at'] or user['stage']=='lesson_completed': return 'form_start'
     if user['lesson_received_at'] or user['stage']=='lesson_video_sent': return 'watch'
-    if user['stage']=='lesson_opened': return 'open_lesson'
+    if user['stage']=='lesson_opened': return 'form_start'
     if user['stage']=='subscription_required': return 'subscribe'
     return 'welcome'
 
@@ -471,7 +473,7 @@ def queue_questionnaire(user_id: int) -> None:
     user = get_user(user_id)
     if not user or not user['recommendation']:
         return
-    text = '📝 <b>Анкета з безкоштовного уроку</b>\n\n'
+    text = '📝 <b>Анкета перед безкоштовним уроком</b>\n\n'
     for key, label in [('first_name', 'Ім’я'), ('username', 'Нік'), ('source', 'Джерело'),
                        ('experience', 'Досвід'), ('capital', 'Капітал'), ('goal', 'Ціль'),
                        ('support', 'Підтримка'), ('recommendation', 'Рекомендація'), ('contact', 'Контакт')]:
@@ -687,14 +689,19 @@ def excel_bytes(rows):
 
 
 def main_menu(user_id: int | None = None) -> InlineKeyboardMarkup:
+    user=get_user(user_id) if user_id is not None else None
+    rows=[
+        [InlineKeyboardButton(text="🎁 Отримати безкоштовний урок", callback_data="lesson")],
+        [InlineKeyboardButton(text="📚 Програма навчання", callback_data="program")],
+        [InlineKeyboardButton(text="💎 Тарифи", callback_data="tariffs")],
+    ]
+    if user and user['recommendation']:
+        rows.append([InlineKeyboardButton(text="▶️ Переглянути урок",callback_data="watch_lesson")])
+    elif user and user['questionnaire_started_at']:
+        rows.append([InlineKeyboardButton(text="📝 Продовжити анкету",callback_data="resume_form")])
+    rows.append([InlineKeyboardButton(text="👨‍💻 Написати Михайлу", url=CONTACT_URL)])
     return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🎁 Отримати безкоштовний урок", callback_data="lesson")],
-            [InlineKeyboardButton(text="📚 Програма навчання", callback_data="program")],
-            [InlineKeyboardButton(text="💎 Тарифи", callback_data="tariffs")],
-            [InlineKeyboardButton(text="📝 Продовжити / пройти анкету", callback_data="resume_form")],
-            [InlineKeyboardButton(text="👨‍💻 Написати Михайлу", url=CONTACT_URL)],
-        ]
+        inline_keyboard=rows
     )
 
 
@@ -707,10 +714,11 @@ def subscription_menu() -> InlineKeyboardMarkup:
     )
 
 
-def lesson_menu() -> InlineKeyboardMarkup:
+def lesson_menu(ready: bool = False) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="▶️ Переглянути безкоштовний урок", callback_data="watch_lesson")],
+            [InlineKeyboardButton(text="▶️ Переглянути урок" if ready else "📝 Пройти анкету й отримати урок",
+                                  callback_data="watch_lesson" if ready else "resume_form")],
             [InlineKeyboardButton(text="🏠 Головне меню", callback_data="menu")],
         ]
     )
@@ -739,6 +747,7 @@ def recommendation_menu(tariff: str) -> InlineKeyboardMarkup:
     labels = {"BASIC": "БАЗОВИЙ", "GROUP": "ГРУПОВИЙ", "MASTER": "P2P MASTER"}
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="▶️ Отримати безкоштовний урок", callback_data="watch_lesson")],
             [
                 InlineKeyboardButton(
                     text=f"📚 Що входить у {labels[tariff]}",
@@ -783,33 +792,45 @@ async def subscribed(bot: Bot, user_id: int) -> bool:
 async def show_menu(target: Message) -> None:
     await target.answer(
         "<b>REMARENKO P2P</b> 🚀\n\n"
-        "Отримай безкоштовний практичний урок про P2P, подивись програму "
-        "та підбери формат навчання під свій досвід і ціль.",
+        "Отримай безкоштовний практичний урок про P2P. Спершу відповідай на "
+        "4 короткі запитання: бот підбере формат під твій досвід і ціль, "
+        "а після анкети відкриє відеоурок.",
         reply_markup=main_menu(target.chat.id),
     )
 
 
 async def send_lesson_card(message: Message, confirmed: bool = False) -> None:
+    user=get_user(message.chat.id)
     prefix = "✅ <b>Підписку підтверджено.</b>\n\n" if confirmed else ""
     caption = (
         prefix
-        + "🎁 <b>Твій безкоштовний урок уже доступний!</b>\n\n"
+        + "🎁 <b>Твій безкоштовний урок чекає на тебе!</b>\n\n"
         "У ньому ти побачиш практичну P2P-зв’язку, логіку розрахунку та ризики, "
         "які потрібно перевірити перед роботою. Результат залежить від ринку, "
         "комісій і правильності виконання.\n\n"
-        "Після перегляду бот допоможе підібрати наступний крок."
+        "📝 <b>Як отримати відео:</b> натисни кнопку нижче та відповідай на "
+        "4 короткі запитання. Бот підбере формат навчання, а одразу після "
+        "анкети відкриє тобі безкоштовний урок. Контакт для перегляду не потрібний."
     )
+    if user and user['recommendation']:
+        caption = (prefix + "✅ <b>Твоя анкета вже завершена.</b>\n\n"
+                   "Безкоштовний урок про практичну P2P-зв’язку доступний кнопкою нижче.")
     cover_id = get_setting("lesson_cover_file_id")
     if cover_id:
         try:
-            await message.answer_photo(photo=cover_id, caption=caption, reply_markup=lesson_menu())
+            await message.answer_photo(photo=cover_id, caption=caption, reply_markup=lesson_menu(bool(user and user['recommendation'])))
             return
         except TelegramBadRequest:
             logging.exception("Stored lesson cover is invalid; falling back to text")
-    await message.answer(caption, reply_markup=lesson_menu())
+    await message.answer(caption, reply_markup=lesson_menu(bool(user and user['recommendation'])))
 
 
 async def send_lesson_video(message: Message) -> None:
+    user=get_user(message.chat.id)
+    if not user or not user['recommendation']:
+        await message.answer("📝 Спочатку пройди 4 запитання анкети — після них відкриється відеоурок.",
+                             reply_markup=lesson_menu())
+        return
     video_id = get_setting("lesson_video_file_id")
     if video_id:
         try:
@@ -817,14 +838,15 @@ async def send_lesson_video(message: Message) -> None:
                 video=video_id,
                 caption=(
                     "▶️ <b>Безкоштовний практичний урок REMARENKO P2P</b>\n\n"
-                    "Переглянь до кінця, а потім натисни «Я переглянув урок» — "
-                    "бот підбере формат навчання під твою ситуацію."
+                    "Твій формат уже підібрано за відповідями. Переглянь практичний "
+                    "розбір до кінця, а потім натисни «Я переглянув урок»."
                 ),
                 supports_streaming=True,
                 reply_markup=lesson_finished_menu(),
             )
             update_user(message.chat.id, stage="lesson_video_sent")
             record_event(message.chat.id, "lesson_video_sent")
+            schedule_funnel(message.chat.id)
             return
         except TelegramBadRequest:
             logging.exception("Stored lesson video is invalid; using fallback")
@@ -840,6 +862,7 @@ async def send_lesson_video(message: Message) -> None:
         )
         update_user(message.chat.id, stage='lesson_video_sent')
         record_event(message.chat.id, 'lesson_video_sent', 'fallback_link_issued')
+        schedule_funnel(message.chat.id)
         return
     await message.answer(
         "🎬 Відео ще готується до публікації. Спробуй відкрити урок пізніше або напиши Михайлу.",
@@ -861,7 +884,7 @@ async def lesson_gate(message: Message, confirmed: bool = False) -> None:
         return
     update_user(user_id, subscribed=0, stage="subscription_required")
     await message.answer(
-        "Щоб відкрити безкоштовний урок, підпишися на канал "
+        "Щоб побачити обкладинку, пройти коротку анкету та відкрити урок, підпишися на канал "
         "<b>REMARENKO P2P</b>, а потім натисни кнопку перевірки.",
         reply_markup=subscription_menu(),
     )
@@ -949,7 +972,8 @@ def recommendation_text(tariff: str, reason: str) -> str:
         f"За твоїми відповідями тобі {html.escape(reason)}.\n\n"
         f"{details}\n\n"
         "Це рекомендація за відповідями, а не гарантія фінансового результату. "
-        "Натисни нижче, щоб переглянути програму або обговорити деталі."
+        "Анкету завершено ✅ Тепер натисни «Отримати безкоштовний урок» нижче. "
+        "Контакт залишати не потрібно."
     )
 
 
@@ -1170,13 +1194,23 @@ async def check_subscription(callback: CallbackQuery) -> None:
         update_user(callback.from_user.id, subscribed=1, stage="lesson_opened")
         record_event(callback.from_user.id, "subscription_confirmed")
         await callback.answer("Підписку підтверджено ✅")
-        await send_lesson_card(callback.message, confirmed=True)
+        user=get_user(callback.from_user.id)
+        if user and user['recommendation']:
+            await send_lesson_video(callback.message)
+        else:
+            await send_lesson_card(callback.message, confirmed=True)
     else:
         await callback.answer("Підписку поки не знайдено", show_alert=True)
 
 
 @router.callback_query(F.data == "watch_lesson")
 async def watch_lesson(callback: CallbackQuery) -> None:
+    user=get_user(callback.from_user.id)
+    if not user or not user['recommendation']:
+        await callback.answer('Спочатку 4 короткі запитання анкети',show_alert=True)
+        await callback.message.answer('📝 Анкета допоможе підібрати формат; відразу після неї отримаєш урок.',
+                                      reply_markup=lesson_menu())
+        return
     if not await subscribed(callback.bot, callback.from_user.id):
         update_user(callback.from_user.id, subscribed=0, stage="subscription_required")
         await callback.answer("Спочатку підпишися на канал", show_alert=True)
@@ -1200,6 +1234,16 @@ async def lesson_done(callback: CallbackQuery) -> None:
     record_event(callback.from_user.id, "lesson_completed")
     schedule_form_reminder(callback.from_user.id)
     await callback.answer("Урок відмічено як переглянутий ✅")
+    if user['recommendation']:
+        await callback.message.answer(
+            "🔥 <b>Чудово!</b> Анкету й урок завершено. Якщо хочеш розібрати "
+            "наступні кроки у своєму форматі навчання, залиш контакт для консультації.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="📲 Хочу консультацію",callback_data="contact_start")],
+                [InlineKeyboardButton(text="🏠 Головне меню",callback_data="menu")],
+            ]),
+        )
+        return
     await callback.message.answer(
         "🔥 <b>Чудово!</b> Відповідай на 4 короткі запитання кнопками — "
         "і бот одразу порекомендує формат навчання під твою ситуацію.",
@@ -1224,11 +1268,8 @@ async def tariffs_callback(callback: CallbackQuery) -> None:
 @router.callback_query(F.data == "apply")
 async def apply_start(callback: CallbackQuery, state: FSMContext) -> None:
     user=get_user(callback.from_user.id)
-    if user and (user['contact'] or user['stage']=='application_completed'):
-        await callback.answer('Твоя заявка вже збережена ✅',show_alert=True)
-        return
     if user and user['recommendation']:
-        await contact_start(callback,state)
+        await watch_lesson(callback)
         return
     if await state.get_state():
         await callback.answer()
@@ -1241,6 +1282,8 @@ async def apply_start(callback: CallbackQuery, state: FSMContext) -> None:
     schedule_form_reminder(callback.from_user.id)
     await callback.answer()
     await callback.message.answer(
+        "📝 <b>4 короткі запитання — і ти отримаєш безкоштовний відеоурок.</b>\n"
+        "Спершу підберемо формат навчання під твою ситуацію.\n\n"
         "<b>1/4. Який у тебе досвід у P2P?</b>",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
@@ -1271,16 +1314,17 @@ async def ask_form_step(message: Message, step: str) -> None:
 
 @router.callback_query(F.data == 'resume_form')
 async def resume_form(callback: CallbackQuery, state: FSMContext) -> None:
+    user = get_user(callback.from_user.id)
+    if user and user['recommendation'] and not user['contact']:
+        await watch_lesson(callback)
+        return
     step = await state.get_state()
     if step:
         await callback.answer('Продовжуємо з місця, де зупинились')
         await ask_form_step(callback.message, step)
     else:
-        user = get_user(callback.from_user.id)
-        if user and (user['contact'] or user['stage'] == 'application_completed'):
-            await callback.answer('Твоя заявка вже збережена ✅', show_alert=True)
-        elif user and user['recommendation']:
-            await contact_start(callback, state)
+        if user and user['recommendation']:
+            await watch_lesson(callback)
         elif user and reminder_step(user).startswith('form_') and reminder_step(user)!='form_start':
             # Recover even forms started on an old release that used in-memory FSM storage.
             maps={
@@ -1549,7 +1593,7 @@ async def apply_contact(message: Message, state: FSMContext) -> None:
     user = get_user(message.from_user.id)
     username = f"@{message.from_user.username}" if message.from_user.username else "немає"
     admin_text = (
-        "🔥 <b>Нова заявка з безкоштовного уроку</b>\n\n"
+        "🔥 <b>Нова заявка після анкети</b>\n\n"
         f"Ім’я: {html.escape(message.from_user.full_name)}\n"
         f"Telegram: {html.escape(username)}\n"
         f"ID: <code>{message.from_user.id}</code>\n"
@@ -1721,18 +1765,18 @@ def should_skip_scheduled(kind: str, user: sqlite3.Row | None) -> bool:
 
 REMINDER_COPY = {
     'welcome': (
-        '🎁 Ти запустив бота, але ще не відкрив безкоштовний урок. Натисни кнопку нижче — почнемо з доступу до відео.',
-        '▶️ Урок про практичну логіку P2P залишається доступним. Почни, коли матимеш час переглянути матеріал уважно.',
-        '💡 В уроці розбираємо послідовність роботи зі зв’язкою та розрахунок результату з урахуванням комісій. Відкрити його можна нижче.',
-        '📚 Хочеш розібратися в P2P на конкретному прикладі? Повернися до безкоштовного уроку — доступ ще є.',
-        '👋 Останнє нагадування про відкриття уроку на цьому етапі. Матеріал і меню залишаться доступними, навіть якщо вирішиш повернутися пізніше.',
+        '🎁 У боті на тебе чекає картка безкоштовного уроку. Натисни кнопку: після 4 коротких відповідей отримаєш відео.',
+        '▶️ Урок про практичну P2P-зв’язку починається з короткої анкети. Бот підбере формат і відкриє відео.',
+        '💡 Перш ніж розбирати зв’язку й комісії, дай 4 відповіді про свій досвід та ціль. Тоді одразу отримаєш урок.',
+        '📚 Хочеш побачити практичний приклад? Відкрий картку уроку й пройди анкету кнопками — це займе лише кілька кроків.',
+        '👋 Останнє нагадування на цьому етапі: картка, анкета та відеоурок чекатимуть на тебе в боті.',
     ),
     'subscribe': (
-        '🔐 Залишилося підтвердити підписку на канал, щоб відкрити урок. Після вступу натисни «Перевірити підписку».',
-        '🎁 Відеоурок чекає в боті. Підпишися на канал за кнопкою та повернися сюди для перевірки.',
+        '🔐 Підтвердь підписку на канал, щоб перейти до картки уроку й анкети. Після 4 відповідей відкриється відео.',
+        '🎁 Картка уроку чекає в боті. Підпишися на канал за кнопкою та повернися для перевірки.',
         '📌 Якщо ти вже вступив до каналу, натисни перевірку підписки. Сам перехід за посиланням ще не підтверджує вступ.',
-        '▶️ Щоб продовжити до відео, перевір підписку кнопкою нижче. Якщо доступ не відкривається, напиши @P2P_Marshal.',
-        '👋 Останнє нагадування на етапі підписки. Коли будеш готовий, підтвердь вступ — урок залишиться доступним у боті.',
+        '▶️ Перевір підписку кнопкою нижче, тоді пройди 4 запитання для доступу до відео. Якщо не виходить, напиши @P2P_Marshal.',
+        '👋 Останнє нагадування на етапі підписки. Коли будеш готовий, підтвердь вступ і пройди анкету для уроку.',
     ),
     'open_lesson': (
         '▶️ Доступ до уроку відкрито. Натисни кнопку, щоб отримати відео в цьому чаті.',
@@ -1749,11 +1793,11 @@ REMINDER_COPY = {
         '👋 Останнє нагадування про перегляд на цьому етапі. Відео залишається доступним; після перегляду можеш продовжити анкету.',
     ),
     'form_start': (
-        '📝 Ти позначив урок переглянутим. Тепер 4 короткі запитання допоможуть підібрати формат під твій досвід і цілі.',
-        '🎯 Хочеш зрозуміти наступний крок після уроку? Почни анкету: відповіді обираються кнопками.',
-        '💬 У кожного свій досвід, капітал і потреба в підтримці. В анкеті врахуємо саме твою ситуацію.',
-        '📚 Після 4 відповідей бот покаже рекомендований формат навчання. Це рекомендація — рішення залишиться за тобою.',
-        '👋 Останнє нагадування почати анкету на цьому етапі. Якщо навчання актуальне, можеш пройти її кнопкою нижче.',
+        '📝 Ти відкрив картку уроку. Відповідай на 4 короткі запитання — одразу після рекомендації отримаєш відео.',
+        '🎯 Відеоурок чекає після анкети. Почни з питання про досвід: відповіді обираються кнопками.',
+        '💬 Анкета врахує твій досвід, капітал, ціль і потрібну підтримку. Після неї відкриється урок.',
+        '📚 Після 4 відповідей бот покаже рекомендований формат і відкриє безкоштовний урок. Контакт для цього не потрібний.',
+        '👋 Останнє нагадування почати анкету на цьому етапі. Твоя картка уроку залишається доступною.',
     ),
     'form_exp': (
         '📝 Зупинилися на питанні 1/4: який у тебе досвід у P2P? Обери варіант, який найближчий до твоєї ситуації.',
@@ -1778,10 +1822,17 @@ REMINDER_COPY = {
     ),
     'form_support': (
         '📝 Залишилося питання 4/4: який рівень підтримки тобі потрібний — самостійно, з групою чи з максимальним супроводом?',
-        '🤝 Обери зручний рівень підтримки. Це остання відповідь перед рекомендацією формату навчання.',
+        '🤝 Обери зручний рівень підтримки. Це остання відповідь перед рекомендацією та відеоуроком.',
         '🎯 Досвід, капітал і ціль уже збережені. Залишилося уточнити, наскільки важлива для тебе допомога ментора.',
-        '📚 Продовж останнє питання анкети — після відповіді бот сформує рекомендацію під твою ситуацію.',
-        '👋 Останнє нагадування про питання «Підтримка». Можеш завершити анкету одним вибором нижче.',
+        '📚 Продовж останнє питання анкети — після відповіді отримаєш рекомендацію й доступ до відео.',
+        '👋 Останнє нагадування про питання «Підтримка». Один вибір — і урок відкриється.',
+    ),
+    'lesson_ready': (
+        '🎬 Анкету завершено, тариф підібрано. Натисни кнопку нижче, щоб отримати безкоштовний відеоурок.',
+        '▶️ Відеоурок про практичну P2P-зв’язку чекає на тебе. Відкрий його після своєї рекомендації.',
+        '🧮 У відео розберемо логіку зв’язки, комісії та ризики. Анкету повторювати не треба — урок доступний.',
+        '📚 Твій наступний крок уже відкритий: переглянь безкоштовний урок кнопкою нижче.',
+        '👋 Останнє нагадування про отримання уроку. Рекомендація збережена, відео можна відкрити пізніше.',
     ),
     'offer': (
         '🎯 Рекомендація за твоїми відповідями готова. Якщо хочеш обговорити формат навчання, натисни «Хочу консультацію».',
@@ -1815,7 +1866,8 @@ async def send_scheduled_message(bot: Bot, kind: str, user_id: int, user: sqlite
     else:
         action,label={
             'welcome':('lesson','🎁 Отримати урок'),
-            'open_lesson':('watch_lesson','▶️ Відкрити відеоурок'),
+            'open_lesson':('resume_form','📝 Пройти анкету'),
+            'lesson_ready':('watch_lesson','▶️ Отримати відеоурок'),
             'watch':('watch_lesson','▶️ Повернутися до уроку'),
             'form_start':('resume_form','📝 Підібрати формат'),
             'offer':('contact_start','💬 Хочу консультацію'),

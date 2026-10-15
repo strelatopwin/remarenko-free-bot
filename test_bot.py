@@ -152,6 +152,22 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
         view['search']=''; view['tariff']='BASIC'
         self.assertEqual(bot.lead_rows(view,0)[0],0)
 
+    async def test_cover_stays_first_and_old_watch_button_cannot_skip_questionnaire(self):
+        bot.set_setting('lesson_cover_file_id','stored_cover')
+        message=SimpleNamespace(chat=SimpleNamespace(id=50),answer_photo=AsyncMock(),answer=AsyncMock())
+        await bot.send_lesson_card(message)
+        kwargs=message.answer_photo.call_args.kwargs
+        self.assertEqual(kwargs['photo'],'stored_cover')
+        self.assertEqual(kwargs['reply_markup'].inline_keyboard[0][0].callback_data,'resume_form')
+        self.assertIn('4 короткі запитання',kwargs['caption'])
+        self.assertFalse(any(button.callback_data=='resume_form' for row in bot.main_menu(50).inline_keyboard for button in row))
+        callback=SimpleNamespace(from_user=SimpleNamespace(id=50),answer=AsyncMock(),message=message,bot=SimpleNamespace())
+        await bot.watch_lesson(callback)
+        self.assertIsNone(bot.get_user(50)['lesson_received_at'])
+        bot.update_user(50,stage='recommendation_shown',recommendation='BASIC')
+        await bot.send_lesson_card(message)
+        self.assertEqual(message.answer_photo.call_args.kwargs['reply_markup'].inline_keyboard[0][0].callback_data,'watch_lesson')
+
     async def test_1000_records_page_and_full_excel_export(self):
         import io
         from openpyxl import load_workbook
@@ -251,14 +267,14 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
 
     def test_all_funnel_steps_and_final_contact_stop(self):
         stages=[({'stage':'subscription_required'},'subscribe'),
-                ({'stage':'lesson_opened','subscribed':1},'open_lesson'),
+                ({'stage':'lesson_opened','subscribed':1},'form_start'),
                 ({'stage':'lesson_video_sent'},'watch'),
                 ({'stage':'lesson_completed'},'form_start'),
                 ({'stage':'questionnaire_started'},'form_exp'),
                 ({'experience':'Новачок'},'form_cap'),
                 ({'capital':'До $200'},'form_goal'),
                 ({'goal':'Стартувати з нуля'},'form_support'),
-                ({'support':'Навчатися самостійно','recommendation':'BASIC','stage':'recommendation_shown'},'offer'),
+                ({'support':'Навчатися самостійно','recommendation':'BASIC','stage':'recommendation_shown'},'lesson_ready'),
                 ({'stage':'contact_requested'},'contact')]
         for values,expected in stages:
             bot.update_user(50,**values)
@@ -417,6 +433,10 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
         try:
             message=SimpleNamespace(chat=SimpleNamespace(id=50),answer=AsyncMock())
             await bot.send_lesson_video(message)
+            self.assertIsNone(bot.get_user(50)['lesson_received_at'])
+            self.assertIn('Спочатку пройди',message.answer.call_args.args[0])
+            bot.update_user(50,recommendation='GROUP',stage='recommendation_shown')
+            await bot.send_lesson_video(message)
             self.assertIsNotNone(bot.get_user(50)['lesson_received_at'])
         finally: bot.LESSON_URL=previous
 
@@ -425,12 +445,15 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
         await bot.lesson_done(callback)
         callback.message.answer.assert_not_awaited()
 
-    async def test_resume_after_recommendation_asks_for_contact(self):
+    async def test_resume_after_recommendation_opens_lesson(self):
         bot.update_user(50,stage='recommendation_shown',recommendation='GROUP')
         state=SimpleNamespace(get_state=AsyncMock(return_value=None),set_state=AsyncMock())
-        callback=SimpleNamespace(from_user=SimpleNamespace(id=50,username='student'),answer=AsyncMock(),message=SimpleNamespace(answer=AsyncMock()))
-        await bot.resume_form(callback,state)
-        state.set_state.assert_awaited_once_with(bot.LeadForm.contact)
+        callback=SimpleNamespace(from_user=SimpleNamespace(id=50,username='student'),answer=AsyncMock(),message=SimpleNamespace(chat=SimpleNamespace(id=50),answer=AsyncMock()),bot=SimpleNamespace())
+        from unittest.mock import patch
+        with patch.object(bot,'subscribed',new=AsyncMock(return_value=True)):
+            await bot.resume_form(callback,state)
+        state.set_state.assert_not_awaited()
+        self.assertTrue(callback.message.answer.await_count)
 
     async def test_questionnaire_notifies_owner_before_contact(self):
         api=SimpleNamespace(send_message=AsyncMock(return_value=SimpleNamespace(message_id=777)))
