@@ -63,10 +63,10 @@ class PersistenceTests(unittest.TestCase):
             ).fetchall()
         self.assertEqual(
             [row["kind"] for row in rows],
-            ["lesson_reminder", "value_case", "tariff_offer", "final_cta"],
+            [f"stage:1:welcome:{i}" for i in range(1,6)],
         )
 
-    def test_test_mode_resets_all_four_timers(self):
+    def test_test_mode_resets_all_five_timers(self):
         with bot.connect() as db:
             db.execute(
                 """
@@ -86,7 +86,7 @@ class PersistenceTests(unittest.TestCase):
                 WHERE user_id=2 AND sent_at IS NULL AND canceled_at IS NULL
                 """
             ).fetchone()[0]
-        self.assertEqual(count, 4)
+        self.assertEqual(count, 5)
 
     def test_reopening_lesson_does_not_regress_progress(self):
         with bot.connect() as db:
@@ -106,7 +106,9 @@ class PersistenceTests(unittest.TestCase):
             self.assertEqual(db.execute('SELECT text FROM lead_notifications WHERE user_id=8').fetchone()[0], 'Lead text')
             self.assertEqual(db.execute('SELECT COUNT(*) FROM scheduled_messages WHERE user_id=8 AND canceled_at IS NULL').fetchone()[0], 0)
 
-    def test_three_form_reminders_do_not_restart_on_repeat_click(self):
+    def test_five_form_reminders_do_not_restart_on_repeat_click(self):
+        with bot.connect() as db:
+            db.execute('INSERT INTO users(telegram_id,stage,created_at,updated_at) VALUES(90,?,?,?)',('lesson_completed',bot.now_iso(),bot.now_iso()))
         bot.schedule_form_reminder(90)
         with bot.connect() as db:
             before=[tuple(r) for r in db.execute('SELECT kind,due_at,created_at FROM scheduled_messages WHERE user_id=90 ORDER BY due_at')]
@@ -114,19 +116,20 @@ class PersistenceTests(unittest.TestCase):
         with bot.connect() as db:
             after=[tuple(r) for r in db.execute('SELECT kind,due_at,created_at FROM scheduled_messages WHERE user_id=90 ORDER BY due_at')]
         self.assertEqual(before,after)
-        self.assertEqual(len(before),3)
+        self.assertEqual(len(before),5)
         hours=[round((datetime.fromisoformat(r[1])-datetime.fromisoformat(r[2])).total_seconds()/3600) for r in before]
-        self.assertEqual(hours,[2,24,48])
+        self.assertEqual(hours,[1,5,24,48,72])
 
     def test_overdue_form_reminders_are_not_sent_in_a_burst(self):
+        with bot.connect() as db:
+            db.execute('INSERT INTO users(telegram_id,stage,created_at,updated_at) VALUES(90,?,?,?)',('lesson_completed',bot.now_iso(),bot.now_iso()))
         bot.schedule_form_reminder(90)
         with bot.connect() as db:
-            for index,kind in enumerate(('form_reminder','form_reminder_24','form_reminder_48')):
-                db.execute('UPDATE scheduled_messages SET due_at=? WHERE user_id=90 AND kind=?',((bot.utc_now()-timedelta(hours=3-index)).isoformat(),kind))
+            db.execute('UPDATE scheduled_messages SET due_at=? WHERE user_id=90',((bot.utc_now()-timedelta(hours=1)).isoformat(),))
         bot.collapse_overdue_form_reminders()
         with bot.connect() as db:
             rows=db.execute('SELECT kind FROM scheduled_messages WHERE user_id=90 AND canceled_at IS NULL').fetchall()
-        self.assertEqual([r['kind'] for r in rows],['form_reminder_48'])
+        self.assertEqual([r['kind'] for r in rows],['stage:1:form_start:5'])
 
 
 class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
@@ -136,6 +139,243 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
             for table in ('users','funnel_events','scheduled_messages','lead_notifications','form_state','channel_joins'):
                 db.execute(f'DELETE FROM {table}')
             db.execute('INSERT INTO users(telegram_id,created_at,updated_at) VALUES(50,?,?)', (bot.now_iso(),bot.now_iso()))
+
+    def test_search_unicode_literal_and_combined_filters(self):
+        with bot.connect() as db:
+            db.execute("UPDATE users SET first_name='Михайло',username='Test_100%',recommendation='GROUP',lesson_received_at=?,questionnaire_started_at=? WHERE telegram_id=50",(bot.now_iso(),bot.now_iso()))
+        view={**bot.resolve_lead_view('people'),'search':'МИХАЙЛО','tariff':'GROUP','stage':'started'}
+        self.assertEqual(bot.lead_rows(view,0)[0],1)
+        view['search']='@test_100%'
+        self.assertEqual(bot.lead_rows(view,0)[0],1)
+        view['search']="' OR 1=1 --"
+        self.assertEqual(bot.lead_rows(view,0)[0],0)
+        view['search']=''; view['tariff']='BASIC'
+        self.assertEqual(bot.lead_rows(view,0)[0],0)
+
+    async def test_1000_records_page_and_full_excel_export(self):
+        import io
+        from openpyxl import load_workbook
+        with bot.connect() as db:
+            db.execute('DELETE FROM users')
+            db.executemany('INSERT INTO users(telegram_id,first_name,recommendation,created_at,updated_at) VALUES(?,?,?,?,?)',
+                [(i,'=HYPERLINK("bad")' if i==1 else f'Учень {i}','GROUP',bot.now_iso(),bot.now_iso()) for i in range(1,1001)])
+        view=bot.resolve_lead_view('all')
+        count,page,rows=bot.lead_rows(view,124)
+        self.assertEqual((count,page,len(rows)),(1000,124,8))
+        message=SimpleNamespace(answer=AsyncMock())
+        await bot.show_leads(message,'all',124)
+        self.assertIn('Сторінка 125 із 125',message.answer.call_args.args[0])
+        _,_,allrows=bot.lead_rows(view)
+        self.assertEqual(len(allrows),1000)
+        book=load_workbook(io.BytesIO(bot.excel_bytes(allrows)))
+        sheet=book.active
+        self.assertEqual(sheet.max_row,1001)
+        formula_row=next(row for row in sheet.iter_rows(min_row=2) if row[0].value=='1')
+        self.assertEqual(formula_row[1].value,'=HYPERLINK("bad")')
+        self.assertEqual(formula_row[1].data_type,'s')
+        self.assertEqual(sheet.freeze_panes,'A2')
+        self.assertEqual(sheet.auto_filter.ref,'A1:N1001')
+
+    async def test_filtered_context_survives_card_status_and_back(self):
+        bot.update_user(50,recommendation='GROUP')
+        token=bot.save_lead_view({**bot.resolve_lead_view('people'),'tariff':'GROUP'})
+        self.assertEqual(bot.resolve_lead_view(token)['tariff'],'GROUP')
+        msg=SimpleNamespace(edit_text=AsyncMock())
+        callback=SimpleNamespace(from_user=SimpleNamespace(id=bot.ADMIN_CHAT_ID),answer=AsyncMock(),message=msg,data=f'adminlead:detail:50:{token}:0')
+        await bot.admin_lead_callback(callback)
+        markup=msg.edit_text.call_args.kwargs['reply_markup']
+        callback.data=markup.inline_keyboard[1][0].callback_data
+        self.assertLessEqual(len(callback.data.encode()),64)
+        await bot.admin_lead_callback(callback)
+        back=msg.edit_text.call_args.kwargs['reply_markup'].inline_keyboard[-1][0].callback_data
+        self.assertEqual(back,f'adminlead:list:{token}:0')
+        callback.data=back
+        await bot.admin_lead_callback(callback)
+        self.assertIn('Тариф: Груповий',msg.edit_text.call_args.args[0])
+
+    async def test_owner_search_input_and_export_permissions(self):
+        message=SimpleNamespace(answer=AsyncMock(),answer_document=AsyncMock(),edit_text=AsyncMock())
+        callback=SimpleNamespace(from_user=SimpleNamespace(id=51),answer=AsyncMock(),message=message,data='av:export:people')
+        await bot.admin_view_callback(callback)
+        message.answer_document.assert_not_awaited()
+        callback.from_user.id=bot.ADMIN_CHAT_ID; callback.data='av:search:people'
+        await bot.admin_view_callback(callback)
+        message.from_user=SimpleNamespace(id=bot.ADMIN_CHAT_ID); message.text='50'
+        self.assertTrue(bot.is_admin_list_input(message))
+        await bot.admin_list_input(message)
+        self.assertIn('Пошук: 50',message.answer.call_args.args[0])
+        self.assertFalse(bot.is_admin_list_input(message))
+        callback.data='av:export:'+bot.get_setting('admin_current_view')
+        await bot.admin_view_callback(callback)
+        document=message.answer_document.call_args.args[0]
+        self.assertTrue(document.filename.endswith('.xlsx'))
+
+    def test_today_uses_kyiv_midnight_and_original_entry(self):
+        from unittest.mock import patch
+        fixed=datetime(2026,10,15,0,30,tzinfo=timezone.utc)
+        with bot.connect() as db:
+            db.execute('UPDATE users SET created_at=?,updated_at=? WHERE telegram_id=50',('2026-10-14T22:00:00+00:00',fixed.isoformat()))
+        view={**bot.resolve_lead_view('people'),'date':'today'}
+        with patch.object(bot,'utc_now',return_value=fixed):
+            self.assertEqual(bot.lead_rows(view,0)[0],1)
+        with bot.connect() as db:
+            db.execute('UPDATE users SET created_at=? WHERE telegram_id=50',('2026-10-14T20:00:00+00:00',))
+        with patch.object(bot,'utc_now',return_value=fixed):
+            self.assertEqual(bot.lead_rows(view,0)[0],0)
+
+    def test_new_step_restarts_five_deadlines_and_old_series_is_stale(self):
+        from unittest.mock import patch
+        anchor=datetime(2026,10,15,10,tzinfo=timezone.utc)
+        with patch.object(bot,'utc_now',return_value=anchor):
+            bot.update_user(50,stage='questionnaire_started')
+        original=bot.get_user(50)
+        self.assertEqual(original['reminder_step'],'form_exp')
+        old_kind=f'stage:{original["reminder_generation"]}:form_exp:1'
+        with patch.object(bot,'utc_now',return_value=anchor+timedelta(hours=3)):
+            bot.update_user(50,experience='Новачок')
+        user=bot.get_user(50)
+        self.assertEqual(user['reminder_step'],'form_cap')
+        self.assertTrue(bot.should_skip_scheduled(old_kind,user))
+        with bot.connect() as db:
+            rows=db.execute('SELECT * FROM scheduled_messages WHERE user_id=50 AND canceled_at IS NULL ORDER BY due_at').fetchall()
+        self.assertEqual(len(rows),5)
+        self.assertEqual([int((datetime.fromisoformat(r['due_at'])-anchor-timedelta(hours=3)).total_seconds()/3600) for r in rows],[1,5,24,48,72])
+        before=[(r['kind'],r['due_at']) for r in rows]
+        bot.update_user(50,lead_status='work')
+        bot.schedule_funnel(50)
+        bot.initialize_stage_reminders()
+        bot.initialize_stage_reminders()
+        with bot.connect() as db:
+            after=[tuple(r) for r in db.execute('SELECT kind,due_at FROM scheduled_messages WHERE user_id=50 AND canceled_at IS NULL ORDER BY due_at')]
+        self.assertEqual(before,after)
+
+    def test_all_funnel_steps_and_final_contact_stop(self):
+        stages=[({'stage':'subscription_required'},'subscribe'),
+                ({'stage':'lesson_opened','subscribed':1},'open_lesson'),
+                ({'stage':'lesson_video_sent'},'watch'),
+                ({'stage':'lesson_completed'},'form_start'),
+                ({'stage':'questionnaire_started'},'form_exp'),
+                ({'experience':'Новачок'},'form_cap'),
+                ({'capital':'До $200'},'form_goal'),
+                ({'goal':'Стартувати з нуля'},'form_support'),
+                ({'support':'Навчатися самостійно','recommendation':'BASIC','stage':'recommendation_shown'},'offer'),
+                ({'stage':'contact_requested'},'contact')]
+        for values,expected in stages:
+            bot.update_user(50,**values)
+            user=bot.get_user(50)
+            self.assertEqual(user['reminder_step'],expected)
+            with bot.connect() as db:
+                rows=db.execute('SELECT kind FROM scheduled_messages WHERE user_id=50 AND canceled_at IS NULL AND sent_at IS NULL').fetchall()
+            self.assertEqual(len(rows),5)
+            self.assertTrue(all(expected in r['kind'] for r in rows))
+            self.assertEqual(len(set(bot.REMINDER_COPY[expected])),5)
+        bot.store_application(50,'@student','Application')
+        self.assertEqual(bot.get_user(50)['reminder_step'],'completed')
+        with bot.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM scheduled_messages WHERE user_id=50 AND canceled_at IS NULL AND sent_at IS NULL').fetchone()[0],0)
+
+    async def test_optout_persists_on_deploy_and_progress_and_explicit_optin(self):
+        bot.update_user(50,reminders_enabled=0)
+        bot.update_user(50,stage='questionnaire_started',experience='Новачок')
+        bot.initialize_stage_reminders()
+        callback=SimpleNamespace(from_user=SimpleNamespace(id=50),answer=AsyncMock(),message=SimpleNamespace(answer=AsyncMock()))
+        with bot.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM scheduled_messages WHERE user_id=50 AND canceled_at IS NULL').fetchone()[0],0)
+        await bot.enable_reminders(callback)
+        with bot.connect() as db:
+            before=[tuple(r) for r in db.execute('SELECT kind,due_at FROM scheduled_messages WHERE user_id=50 AND canceled_at IS NULL')]
+        self.assertEqual(len(before),5)
+        await bot.enable_reminders(callback)
+        with bot.connect() as db:
+            after=[tuple(r) for r in db.execute('SELECT kind,due_at FROM scheduled_messages WHERE user_id=50 AND canceled_at IS NULL')]
+        self.assertEqual(before,after)
+
+    async def test_stale_queue_item_cannot_send_after_progress(self):
+        bot.update_user(50,stage='questionnaire_started')
+        stale=bot.get_user(50)
+        with bot.connect() as db:
+            kind=db.execute('SELECT kind FROM scheduled_messages WHERE user_id=50 AND canceled_at IS NULL LIMIT 1').fetchone()[0]
+        bot.update_user(50,experience='Новачок')
+        api=SimpleNamespace(send_message=AsyncMock())
+        self.assertFalse(await bot.send_scheduled_message(api,kind,50,stale))
+        api.send_message.assert_not_awaited()
+        current=bot.get_user(50)
+        with bot.connect() as db:
+            kind=db.execute('SELECT kind FROM scheduled_messages WHERE user_id=50 AND canceled_at IS NULL ORDER BY due_at LIMIT 1').fetchone()[0]
+        self.assertTrue(await bot.send_scheduled_message(api,kind,50,current))
+        self.assertIn('капітал',api.send_message.call_args.args[1])
+
+    async def test_missing_legacy_fsm_recovers_from_saved_answers(self):
+        bot.update_user(50,stage='questionnaire_started',experience='Новачок',capital='До $200')
+        state=SimpleNamespace(get_state=AsyncMock(return_value=None),update_data=AsyncMock(),set_state=AsyncMock())
+        callback=SimpleNamespace(from_user=SimpleNamespace(id=50),answer=AsyncMock(),message=SimpleNamespace(answer=AsyncMock()))
+        await bot.resume_form(callback,state)
+        state.set_state.assert_awaited_once_with(bot.LeadForm.goal)
+        self.assertEqual(state.update_data.call_args.kwargs['capital_code'],'200')
+        self.assertIn('3/4',callback.message.answer.call_args.args[0])
+
+    def test_snapshot_contains_committed_wal_state_and_schedules(self):
+        bot.update_user(50,stage='questionnaire_started',experience='Новачок')
+        bot.set_setting('lesson_video_file_id','test_video')
+        data=bot.database_snapshot()
+        restored=sqlite3.connect(':memory:')
+        try:
+            restored.deserialize(data)
+            self.assertEqual(restored.execute('PRAGMA integrity_check').fetchone()[0],'ok')
+            self.assertEqual(restored.execute('SELECT experience FROM users WHERE telegram_id=50').fetchone()[0],'Новачок')
+            self.assertEqual(restored.execute('SELECT COUNT(*) FROM scheduled_messages WHERE canceled_at IS NULL AND user_id=50').fetchone()[0],5)
+        finally:
+            restored.close()
+
+    def test_legacy_database_migration_preserves_people_media_answers_and_sent_timers(self):
+        previous=bot.DATABASE_PATH
+        with tempfile.TemporaryDirectory() as folder:
+            bot.DATABASE_PATH=str(Path(folder)/'legacy.sqlite3')
+            try:
+                with sqlite3.connect(bot.DATABASE_PATH) as db:
+                    db.execute('''CREATE TABLE users(telegram_id INTEGER PRIMARY KEY,username TEXT,first_name TEXT,
+                        source TEXT NOT NULL DEFAULT 'direct',stage TEXT NOT NULL DEFAULT 'started',subscribed INTEGER NOT NULL DEFAULT 0,
+                        experience TEXT,capital TEXT,goal TEXT,contact TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL)''')
+                    db.execute("INSERT INTO users(telegram_id,first_name,experience,stage,created_at,updated_at) VALUES(777,'Старий клієнт','Новачок','questionnaire_started',?,?)",(bot.now_iso(),bot.now_iso()))
+                bot.connect().close()
+                bot.set_setting('lesson_video_file_id','legacy_video')
+                bot.initialize_stage_reminders()
+                user=bot.get_user(777)
+                self.assertEqual((user['first_name'],user['experience'],user['reminder_step']),('Старий клієнт','Новачок','form_cap'))
+                with bot.connect() as db:
+                    db.execute('UPDATE scheduled_messages SET sent_at=? WHERE user_id=777 AND kind LIKE ?', (bot.now_iso(),'%:1'))
+                    before=[tuple(r) for r in db.execute('SELECT kind,due_at,sent_at FROM scheduled_messages ORDER BY id')]
+                bot.connect().close()
+                bot.initialize_stage_reminders()
+                self.assertEqual(bot.get_setting('lesson_video_file_id'),'legacy_video')
+                with bot.connect() as db:
+                    after=[tuple(r) for r in db.execute('SELECT kind,due_at,sent_at FROM scheduled_messages ORDER BY id')]
+                self.assertEqual(before,after)
+            finally:
+                bot.DATABASE_PATH=previous
+
+    async def test_worker_block_cancels_all_remaining_reminders(self):
+        import asyncio
+        from unittest.mock import patch
+        from aiogram.exceptions import TelegramForbiddenError
+        from aiogram.methods import SendMessage
+        bot.update_user(50,stage='questionnaire_started')
+        with bot.connect() as db:
+            db.execute('UPDATE scheduled_messages SET due_at=? WHERE user_id=50',((bot.utc_now()-timedelta(minutes=1)).isoformat(),))
+        api=SimpleNamespace(send_message=AsyncMock(side_effect=TelegramForbiddenError(method=SendMessage(chat_id=50,text='test'),message='Forbidden: bot was blocked by the user')))
+        with patch.object(bot.asyncio,'sleep',new=AsyncMock(side_effect=asyncio.CancelledError)):
+            with self.assertRaises(asyncio.CancelledError):
+                await bot.funnel_worker(api)
+        self.assertEqual(bot.get_user(50)['reminders_enabled'],0)
+        with bot.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM scheduled_messages WHERE user_id=50 AND canceled_at IS NULL').fetchone()[0],0)
+
+    async def test_backup_and_storage_commands_owner_only(self):
+        message=SimpleNamespace(from_user=SimpleNamespace(id=51),answer=AsyncMock(),answer_document=AsyncMock())
+        await bot.backup_db(message)
+        await bot.storage_status(message)
+        message.answer.assert_not_awaited()
+        message.answer_document.assert_not_awaited()
 
     async def test_form_survives_new_storage_instance(self):
         key = StorageKey(bot_id=123456,chat_id=50,user_id=50)

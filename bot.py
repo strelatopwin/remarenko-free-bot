@@ -11,6 +11,7 @@ import logging
 import math
 import os
 import sqlite3
+import tempfile
 from contextlib import suppress
 from dataclasses import asdict
 from urllib.parse import urlparse
@@ -38,7 +39,7 @@ from aiogram.types import (
 )
 
 
-BOT_VERSION = "2.1.4"
+BOT_VERSION = "2.1.5"
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "788167958"))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/remarenko_free.sqlite3")
@@ -58,12 +59,7 @@ def env_number(name: str, default: float) -> float:
         return default
 
 
-REMINDER_MINUTES = env_number("FUNNEL_REMINDER_MINUTES", 30)
-VALUE_HOURS = env_number("FUNNEL_VALUE_HOURS", 4)
-OFFER_HOURS = env_number("FUNNEL_OFFER_HOURS", 24)
-FINAL_HOURS = env_number("FUNNEL_FINAL_HOURS", 48)
 WORKER_INTERVAL_SECONDS = max(1, env_number("FUNNEL_WORKER_INTERVAL_SECONDS", 20))
-FORM_REMINDER_HOURS = env_number("FUNNEL_FORM_REMINDER_HOURS", 2)
 
 router = Router()
 router.message.filter(F.chat.type == ChatType.PRIVATE)
@@ -127,9 +123,12 @@ def connect() -> sqlite3.Connection:
     )
     existing = {row[1] for row in db.execute("PRAGMA table_info(users)")}
     for column in ("support", "recommendation", "recommendation_reason",
-                   "lesson_received_at", "lesson_completed_at", "questionnaire_started_at"):
+                   "lesson_received_at", "lesson_completed_at", "questionnaire_started_at",
+                   "reminder_step", "reminder_step_at"):
         if column not in existing:
             db.execute(f"ALTER TABLE users ADD COLUMN {column} TEXT")
+    if 'reminder_generation' not in existing:
+        db.execute('ALTER TABLE users ADD COLUMN reminder_generation INTEGER NOT NULL DEFAULT 0')
     if 'lead_status' not in existing:
         db.execute("ALTER TABLE users ADD COLUMN lead_status TEXT NOT NULL DEFAULT 'new'")
     if 'reminders_enabled' not in existing:
@@ -274,6 +273,7 @@ def save_user(message: Message, source: str = "direct") -> bool:
                 now,
             ),
         )
+        sync_stage_reminders(db,message.from_user.id)
         db.commit()
     if not exists:
         record_event(message.from_user.id, "started", source or "direct")
@@ -312,6 +312,7 @@ def update_user(user_id: int, **values: object) -> None:
             f"UPDATE users SET {fields} WHERE telegram_id=?",
             (*clean.values(), user_id),
         )
+        sync_stage_reminders(db,user_id,force=clean.get("reminders_enabled")==1)
         db.commit()
 
 
@@ -333,90 +334,94 @@ def get_setting(key: str) -> str | None:
         return row["value"] if row else None
 
 
+REMINDER_HOURS = (1, 5, 24, 48, 72)
+REMINDER_STEP_LABELS = {
+    'welcome': 'Запустив бота — не відкрив урок',
+    'subscribe': 'Не підтвердив підписку',
+    'open_lesson': 'Не отримав відео',
+    'watch': 'Не позначив урок переглянутим',
+    'form_start': 'Не почав анкету',
+    'form_exp': 'Анкета 1/4 — досвід',
+    'form_cap': 'Анкета 2/4 — капітал',
+    'form_goal': 'Анкета 3/4 — ціль',
+    'form_support': 'Анкета 4/4 — підтримка',
+    'offer': 'Рекомендація готова — не обрав консультацію',
+    'contact': 'Не залишив контакт',
+    'completed': 'Контакт збережено',
+}
+
+
+def reminder_step(user):
+    if user['contact'] or user['stage']=='application_completed': return 'completed'
+    if user['stage']=='contact_requested': return 'contact'
+    if user['recommendation']: return 'offer'
+    if user['stage']=='questionnaire_started' or user['questionnaire_started_at']:
+        for field,step in [('experience','form_exp'),('capital','form_cap'),('goal','form_goal'),('support','form_support')]:
+            if not user[field]: return step
+        return 'form_support'
+    if user['lesson_completed_at'] or user['stage']=='lesson_completed': return 'form_start'
+    if user['lesson_received_at'] or user['stage']=='lesson_video_sent': return 'watch'
+    if user['stage']=='lesson_opened': return 'open_lesson'
+    if user['stage']=='subscription_required': return 'subscribe'
+    return 'welcome'
+
+
+def sync_stage_reminders(db, user_id, *, force=False, test_mode=False):
+    """Run inside the same transaction as the progress update; no half-saved transition."""
+    user=db.execute('SELECT * FROM users WHERE telegram_id=?',(user_id,)).fetchone()
+    if not user: return
+    step=reminder_step(user)
+    now=now_iso()
+    if not user['reminders_enabled'] or step=='completed':
+        db.execute('UPDATE scheduled_messages SET canceled_at=? WHERE user_id=? AND sent_at IS NULL AND canceled_at IS NULL',(now,user_id))
+        db.execute('UPDATE users SET reminder_step=? WHERE telegram_id=?',(step,user_id))
+        return
+    if not force and user['reminder_step']==step:
+        return
+    generation=user['reminder_generation']+1
+    db.execute('UPDATE scheduled_messages SET canceled_at=? WHERE user_id=? AND sent_at IS NULL AND canceled_at IS NULL',(now,user_id))
+    db.execute('UPDATE users SET reminder_step=?,reminder_generation=?,reminder_step_at=? WHERE telegram_id=?',(step,generation,now,user_id))
+    anchor=datetime.fromisoformat(now)
+    for index,hours in enumerate(REMINDER_HOURS,1):
+        delay=timedelta(minutes=index) if test_mode else timedelta(hours=hours)
+        db.execute('INSERT INTO scheduled_messages(user_id,kind,due_at,created_at) VALUES(?,?,?,?)',
+            (user_id,f'stage:{generation}:{step}:{index}',(anchor+delay).isoformat(),now))
+
+
 def schedule_funnel(user_id: int, test_mode: bool = False) -> None:
-    start_at = utc_now()
-    if test_mode:
-        schedule = [
-            ("lesson_reminder", timedelta(minutes=1)),
-            ("value_case", timedelta(minutes=2)),
-            ("tariff_offer", timedelta(minutes=3)),
-            ("final_cta", timedelta(minutes=4)),
-        ]
-    else:
-        schedule = [
-            ("lesson_reminder", timedelta(minutes=REMINDER_MINUTES)),
-            ("value_case", timedelta(hours=VALUE_HOURS)),
-            ("tariff_offer", timedelta(hours=OFFER_HOURS)),
-            ("final_cta", timedelta(hours=FINAL_HOURS)),
-        ]
     with connect() as db:
-        if test_mode:
-            db.execute(
-                "DELETE FROM scheduled_messages WHERE user_id=? AND sent_at IS NULL",
-                (user_id,),
-            )
-        for kind, delay in schedule:
-            db.execute(
-                """
-                INSERT INTO scheduled_messages
-                    (user_id, kind, due_at, created_at)
-                VALUES (?, ?, ?, ?)
-                ON CONFLICT(user_id, kind) DO UPDATE SET
-                    due_at=CASE WHEN ? THEN excluded.due_at ELSE scheduled_messages.due_at END,
-                    sent_at=CASE WHEN ? THEN NULL ELSE scheduled_messages.sent_at END,
-                    canceled_at=CASE WHEN ? THEN NULL ELSE scheduled_messages.canceled_at END,
-                    attempts=CASE WHEN ? THEN 0 ELSE scheduled_messages.attempts END,
-                    last_error=CASE WHEN ? THEN NULL ELSE scheduled_messages.last_error END
-                """,
-                (
-                    user_id,
-                    kind,
-                    (start_at + delay).isoformat(),
-                    now_iso(),
-                    int(test_mode),
-                    int(test_mode),
-                    int(test_mode),
-                    int(test_mode),
-                    int(test_mode),
-                ),
-            )
-        db.commit()
+        db.execute("BEGIN IMMEDIATE")
+        sync_stage_reminders(db,user_id,force=test_mode,test_mode=test_mode)
 
 
 def cancel_pending_funnel(user_id: int) -> None:
     with connect() as db:
-        db.execute(
-            """
-            UPDATE scheduled_messages SET canceled_at=?
-            WHERE user_id=? AND sent_at IS NULL AND canceled_at IS NULL
-            """,
-            (now_iso(), user_id),
-        )
-        db.commit()
+        db.execute('UPDATE scheduled_messages SET canceled_at=? WHERE user_id=? AND sent_at IS NULL AND canceled_at IS NULL',(now_iso(),user_id))
 
 
 def schedule_form_reminder(user_id: int) -> None:
-    now = utc_now()
+    schedule_funnel(user_id)
+
+
+def initialize_stage_reminders():
+    """One-time migration per person. Future deployments preserve due times and sent flags."""
     with connect() as db:
-        previous = db.execute("SELECT created_at FROM scheduled_messages WHERE user_id=? AND kind='form_reminder'", (user_id,)).fetchone()
-        anchor = datetime.fromisoformat(previous['created_at']) if previous else now
-        for kind, hours in [('form_reminder', FORM_REMINDER_HOURS), ('form_reminder_24', max(24, FORM_REMINDER_HOURS+22)),
-                            ('form_reminder_48', max(48, FORM_REMINDER_HOURS+46))]:
-            db.execute('''INSERT INTO scheduled_messages(user_id,kind,due_at,created_at)
-                VALUES(?,?,?,?) ON CONFLICT(user_id,kind) DO NOTHING''',
-                (user_id, kind, (anchor+timedelta(hours=hours)).isoformat(), anchor.isoformat()))
+        # Disable superseded 2.1.4 timer types to prevent overlapping campaigns.
+        db.execute("UPDATE scheduled_messages SET canceled_at=? WHERE kind NOT LIKE 'stage:%' AND sent_at IS NULL AND canceled_at IS NULL",(now_iso(),))
+        for row in db.execute('SELECT telegram_id FROM users').fetchall():
+            sync_stage_reminders(db,row['telegram_id'])
 
 
 def collapse_overdue_form_reminders() -> None:
-    now = now_iso()
+    # If Railway was unavailable, send only the latest due reminder of the current series.
+    now=now_iso()
     with connect() as db:
         db.execute('''UPDATE scheduled_messages SET canceled_at=?
-            WHERE kind IN ('form_reminder','form_reminder_24','form_reminder_48')
-            AND sent_at IS NULL AND canceled_at IS NULL AND due_at<=?
-            AND EXISTS(SELECT 1 FROM scheduled_messages AS later WHERE later.user_id=scheduled_messages.user_id
-                AND later.kind IN ('form_reminder','form_reminder_24','form_reminder_48')
+            WHERE kind LIKE 'stage:%' AND sent_at IS NULL AND canceled_at IS NULL AND due_at<=?
+            AND EXISTS(SELECT 1 FROM scheduled_messages AS later
+                WHERE later.user_id=scheduled_messages.user_id AND later.kind LIKE 'stage:%'
                 AND later.sent_at IS NULL AND later.canceled_at IS NULL
-                AND later.due_at>scheduled_messages.due_at AND later.due_at<=?)''', (now,now,now))
+                AND CAST(substr(later.kind,-1) AS INTEGER)>CAST(substr(scheduled_messages.kind,-1) AS INTEGER) AND later.due_at<=?)''',(now,now,now))
 
 
 LEAD_STATUSES = {'new': '🆕 Нові', 'work': '🛠 В роботі', 'done': '✅ Опрацьовані', 'all': '📋 Усі заявки', 'people': '👥 Усі в боті'}
@@ -444,6 +449,7 @@ def store_application(user_id: int, contact: str, text: str) -> None:
     with connect() as db:
         db.execute("UPDATE users SET stage='application_completed',contact=?,updated_at=? WHERE telegram_id=?",
                    (contact, now, user_id))
+        sync_stage_reminders(db,user_id)
         db.execute('UPDATE scheduled_messages SET canceled_at=? WHERE user_id=? AND sent_at IS NULL AND canceled_at IS NULL', (now, user_id))
         db.execute('INSERT INTO funnel_events(user_id,event,created_at) VALUES(?,\'application_completed\',?)', (user_id, now))
         db.execute("""INSERT INTO lead_notifications(user_id,text,due_at) VALUES(?,?,?)
@@ -670,14 +676,17 @@ def excel_bytes(rows):
     return output.getvalue()
 
 
-def main_menu() -> InlineKeyboardMarkup:
+def main_menu(user_id: int | None = None) -> InlineKeyboardMarkup:
+    user=get_user(user_id) if user_id is not None else None
+    enabled=not user or bool(user['reminders_enabled'])
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🎁 Отримати безкоштовний урок", callback_data="lesson")],
             [InlineKeyboardButton(text="📚 Програма навчання", callback_data="program")],
             [InlineKeyboardButton(text="💎 Тарифи", callback_data="tariffs")],
             [InlineKeyboardButton(text="📝 Продовжити / пройти анкету", callback_data="resume_form")],
-            [InlineKeyboardButton(text="🔕 Вимкнути нагадування", callback_data="stop_reminders")],
+            [InlineKeyboardButton(text="🔕 Вимкнути нагадування" if enabled else "🔔 Увімкнути нагадування",
+                                  callback_data="stop_reminders" if enabled else "enable_reminders")],
             [InlineKeyboardButton(text="👨‍💻 Написати Михайлу", url=CONTACT_URL)],
         ]
     )
@@ -770,7 +779,7 @@ async def show_menu(target: Message) -> None:
         "<b>REMARENKO P2P</b> 🚀\n\n"
         "Отримай безкоштовний практичний урок про P2P, подивись програму "
         "та підбери формат навчання під свій досвід і ціль.",
-        reply_markup=main_menu(),
+        reply_markup=main_menu(target.chat.id),
     )
 
 
@@ -1040,6 +1049,63 @@ async def admin_list_input(message: Message):
     await show_leads(message,origin,page)
 
 
+@router.callback_query(F.data == 'enable_reminders')
+async def enable_reminders(callback: CallbackQuery):
+    user=get_user(callback.from_user.id)
+    if not user:
+        await callback.answer('Спочатку натисни /start',show_alert=True)
+        return
+    if user['reminders_enabled']:
+        await callback.answer('Нагадування вже ввімкнені')
+        return
+    update_user(callback.from_user.id,reminders_enabled=1)
+    await callback.answer('Нагадування ввімкнено')
+    text=('✅ Твій контакт уже збережено. Нагадувань про незавершені кроки немає.' if reminder_step(user)=='completed' else
+          '🔔 Нагадування поточного етапу ввімкнено: через 1, 5, 24, 48 і 72 години. Продовжити можна будь-коли через меню.')
+    await callback.message.answer(text)
+
+
+def database_snapshot():
+    # SQLite backup includes committed WAL data; produce a standalone file without WAL dependencies.
+    with tempfile.TemporaryDirectory(prefix='remarenko-backup-') as folder:
+        path=os.path.join(folder,'backup.sqlite3')
+        with connect() as source:
+            target=sqlite3.connect(path)
+            try:
+                source.backup(target)
+                target.execute('PRAGMA journal_mode=DELETE')
+            finally:
+                target.close()
+        with open(path,'rb') as file:
+            return file.read()
+
+
+@router.message(Command('backup_db'))
+async def backup_db(message: Message):
+    if message.from_user.id!=ADMIN_CHAT_ID: return
+    data=await asyncio.to_thread(database_snapshot)
+    stamp=utc_now().astimezone(KYIV).strftime('%Y-%m-%d_%H-%M')
+    await message.answer_document(BufferedInputFile(data,filename=f'RemarenkoFree_backup_{stamp}.sqlite3'),
+        caption='Резервна копія бази: користувачі, анкети, медіаналаштування та таймери. Збережи файл у себе; він містить дані клієнтів.')
+
+
+@router.message(Command('storage_status'))
+async def storage_status(message: Message):
+    if message.from_user.id!=ADMIN_CHAT_ID: return
+    path=os.path.abspath(DATABASE_PATH)
+    mount=os.getenv('RAILWAY_VOLUME_MOUNT_PATH','')
+    mounted=bool(mount and os.path.commonpath([path,os.path.abspath(mount)])==os.path.abspath(mount))
+    with connect() as db:
+        people=db.execute('SELECT COUNT(*) FROM users').fetchone()[0]
+        timers=db.execute('SELECT COUNT(*) FROM scheduled_messages WHERE sent_at IS NULL AND canceled_at IS NULL').fetchone()[0]
+    await message.answer('<b>💾 Збереження даних</b>\n\n'
+        f'База: <code>{html.escape(path)}</code>\nКористувачів: {people}\nОчікують нагадування: {timers}\n'
+        f'Шлях Volume від Railway: <code>{html.escape(mount or "не підтверджено змінною Railway")}</code>\n'
+        +('✅ Шлях бази розташований усередині вказаного Volume.\n' if mounted else
+          'Перевір у Railway: Volume має бути приєднаний до цього сервісу з Mount Path /data, а DATABASE_PATH — /data/remarenko_free.sqlite3.\n')
+        +'\n/backup_db — завантажити резервну копію. Код оновлення не очищає базу. Для збереження між Deploy потрібен постійний Volume.')
+
+
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
     payload = "direct"
@@ -1151,6 +1217,13 @@ async def tariffs_callback(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "apply")
 async def apply_start(callback: CallbackQuery, state: FSMContext) -> None:
+    user=get_user(callback.from_user.id)
+    if user and (user['contact'] or user['stage']=='application_completed'):
+        await callback.answer('Твоя заявка вже збережена ✅',show_alert=True)
+        return
+    if user and user['recommendation']:
+        await contact_start(callback,state)
+        return
     if await state.get_state():
         await callback.answer()
         await ask_form_step(callback.message, await state.get_state())
@@ -1198,10 +1271,28 @@ async def resume_form(callback: CallbackQuery, state: FSMContext) -> None:
         await ask_form_step(callback.message, step)
     else:
         user = get_user(callback.from_user.id)
-        if user and user['stage'] == 'application_completed':
+        if user and (user['contact'] or user['stage'] == 'application_completed'):
             await callback.answer('Твоя заявка вже збережена ✅', show_alert=True)
         elif user and user['recommendation']:
             await contact_start(callback, state)
+        elif user and reminder_step(user).startswith('form_') and reminder_step(user)!='form_start':
+            # Recover even forms started on an old release that used in-memory FSM storage.
+            maps={
+                'experience': {'Новачок':'new','Були перші угоди':'first','Уже працюю':'active'},
+                'capital': {'До $200':'200','$200–500':'500','$500–1 500':'1500','Понад $1 500':'more'},
+                'goal': {'Стартувати з нуля':'start','Побудувати стабільну систему':'system','Збільшити обороти':'scale'},
+                'support': {'Навчатися самостійно':'self','Група + підтримка ментора':'group','Максимальний супровід':'personal'},
+            }
+            data={}
+            for field,choices in maps.items():
+                if user[field] in choices:
+                    data[field]=user[field]; data[field+'_code']=choices[user[field]]
+            step={'form_exp':LeadForm.experience,'form_cap':LeadForm.capital,
+                  'form_goal':LeadForm.goal,'form_support':LeadForm.support}[reminder_step(user)]
+            await state.update_data(**data)
+            await state.set_state(step)
+            await callback.answer('Продовжуємо з місця, де зупинились')
+            await ask_form_step(callback.message,step.state)
         else:
             await apply_start(callback, state)
 
@@ -1211,7 +1302,7 @@ async def stop_reminders(callback: CallbackQuery) -> None:
     update_user(callback.from_user.id, reminders_enabled=0)
     cancel_pending_funnel(callback.from_user.id)
     await callback.answer('Нагадування вимкнено')
-    await callback.message.answer('🔕 Автоматичні нагадування вимкнено. Урок, анкета та меню залишаються доступними.')
+    await callback.message.answer('🔕 Автоматичні нагадування вимкнено. Урок, анкета та меню залишаються доступними.',reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text='🔔 Увімкнути нагадування',callback_data='enable_reminders')]]))
 
 
 @router.callback_query(F.data.startswith('adminlead:'))
@@ -1246,6 +1337,12 @@ async def admin_lead_callback(callback: CallbackQuery) -> None:
                 if key == 'stage': value = STAGE_LABELS.get(value, value)
                 if key == 'recommendation': value = TARIFF_NAMES.get(value, value)
                 text += f'{label}: {html.escape(str(value))}\n'
+            text += '\nЗупинка: '+html.escape(REMINDER_STEP_LABELS[reminder_step(user)])+'\n'
+            text += 'Нагадування: '+('увімкнено' if user['reminders_enabled'] else 'вимкнено користувачем / недоступні')+'\n'
+            with connect() as db:
+                upcoming=db.execute('SELECT MIN(due_at) FROM scheduled_messages WHERE user_id=? AND sent_at IS NULL AND canceled_at IS NULL',(uid,)).fetchone()[0]
+            if upcoming:
+                text += 'Наступне (Київ): '+datetime.fromisoformat(upcoming).astimezone(KYIV).strftime('%d.%m.%Y %H:%M')+'\n'
             try:
                 await callback.message.edit_text(text, reply_markup=lead_buttons(uid, origin, page))
             except TelegramBadRequest as error:
@@ -1521,7 +1618,9 @@ async def test_timers(message: Message) -> None:
     schedule_funnel(message.from_user.id, test_mode=True)
     await message.answer(
         "🧪 Тестові таймери запущено лише для тебе:\n"
-        "1 хв — нагадування; 2 хв — корисний блок; 3 хв — тариф; 4 хв — фінальний CTA."
+        "5 нагадувань поточного етапу через 1, 2, 3, 4 і 5 хвилин. "
+        "Перехід на новий етап повертає звичайний графік 1/5/24/48/72 години. "
+        "Якщо контакт уже збережено або нагадування вимкнено, серія не запускається."
     )
 
 
@@ -1536,7 +1635,7 @@ async def reset_funnel(message: Message, state: FSMContext) -> None:
             UPDATE users SET stage='started', experience=NULL, capital=NULL, goal=NULL,
                 support=NULL, recommendation=NULL, recommendation_reason=NULL, contact=NULL,
                 lesson_received_at=NULL,lesson_completed_at=NULL,questionnaire_started_at=NULL,
-                reminders_enabled=1,lead_status='new',
+                reminders_enabled=1,lead_status='new',reminder_step=NULL,reminder_step_at=NULL,
                 updated_at=? WHERE telegram_id=?
             """,
             (now_iso(), message.from_user.id),
@@ -1604,98 +1703,122 @@ async def stats(message: Message) -> None:
 
 
 def should_skip_scheduled(kind: str, user: sqlite3.Row | None) -> bool:
-    if not user:
+    if not user or not user['reminders_enabled'] or reminder_step(user)=='completed': return True
+    try:
+        prefix,generation,step,index=kind.split(':')
+        return (prefix!='stage' or int(generation)!=user['reminder_generation']
+                or step!=user['reminder_step'] or step!=reminder_step(user) or not 1<=int(index)<=5)
+    except (ValueError,TypeError):
         return True
-    stage = user["stage"] or "started"
-    if 'reminders_enabled' in user.keys() and not user['reminders_enabled']:
-        return True
-    if stage == "application_completed":
-        return True
-    if kind == "lesson_reminder" and stage in {
-        "lesson_completed",
-        "questionnaire_started",
-        "recommendation_shown",
-        "contact_requested",
-    }:
-        return True
-    if kind in {"tariff_offer", "final_cta", "value_case"} and stage in {
-        "lesson_completed",
-        "questionnaire_started",
-        "recommendation_shown",
-        "contact_requested",
-    }:
-        return True
-    return False
 
 
-async def send_scheduled_message(bot: Bot, kind: str, user_id: int, user: sqlite3.Row) -> None:
-    if kind in {'form_reminder', 'form_reminder_24', 'form_reminder_48'}:
-        text = ('📝 <b>Залишився останній крок — твій контакт.</b>\n\n'
-                'Рекомендація вже готова. Залиш контакт, щоб Михайло міг обговорити з тобою навчання.'
-                if user['recommendation'] else
-                '📝 <b>Ти почав підбирати формат навчання.</b>\n\n'
-                'Продовж анкету з місця, де зупинився. Відповіді збережені — повторювати їх не потрібно.'
-                if user['questionnaire_started_at'] else
-                '📝 <b>Який формат навчання підійде тобі?</b>\n\n'
-                'Ти позначив урок переглянутим. Дай відповіді на 4 короткі питання — '
-                'отримаєш рекомендацію, а Михайло зможе побачити твою анкету.')
-        await bot.send_message(user_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text='📝 Підібрати / продовжити формат', callback_data='resume_form')],
-            [InlineKeyboardButton(text='🔕 Вимкнути нагадування', callback_data='stop_reminders')]]))
-    elif kind == "lesson_reminder":
-        if not user["subscribed"]:
-            await bot.send_message(
-                user_id,
-                "🎁 <b>Твій безкоштовний урок уже чекає.</b>\n\n"
-                "Підпишися на REMARENKO P2P і підтвердь підписку — після цього урок відкриється автоматично.",
-                reply_markup=subscription_menu(),
-            )
-        else:
-            await bot.send_message(
-                user_id,
-                "⏰ <b>Нагадую про безкоштовний урок.</b>\n\n"
-                "У ньому — практична логіка P2P-зв’язки, розрахунок і важливі ризики. "
-                "Відкрий урок, коли матимеш кілька вільних хвилин.",
-                reply_markup=InlineKeyboardMarkup(
-                    inline_keyboard=[[InlineKeyboardButton(text="▶️ Переглянути урок", callback_data="watch_lesson")]]
-                ),
-            )
-    elif kind == "value_case":
-        await bot.send_message(
-            user_id,
-            "💡 <b>Чому сама цифра прибутку нічого не гарантує?</b>\n\n"
-            "У P2P потрібно враховувати курс входу й виходу, комісії, ліквідність, "
-            "ліміти та ризики контрагента. Саме тому в уроці я показую не «магічну кнопку», "
-            "а послідовність розрахунку й перевірки.",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="▶️ Відкрити урок", callback_data="watch_lesson")]]
-            ),
-        )
-    elif kind == "tariff_offer":
-        await bot.send_message(
-            user_id,
-            "🎯 <b>Хочеш зрозуміти, який наступний крок підходить саме тобі?</b>\n\n"
-            "Відповідай на 4 короткі запитання. Бот врахує твій досвід, капітал, "
-            "ціль і потрібний рівень підтримки та покаже рекомендацію.",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="📝 Підібрати формат", callback_data="apply")]]
-            ),
-        )
-    elif kind == "final_cta":
-        await bot.send_message(
-            user_id,
-            "👋 <b>Залишилися запитання щодо P2P або навчання?</b>\n\n"
-            "Можеш переглянути програму, підібрати формат або написати мені особисто. "
-            "Я допоможу зрозуміти, з чого логічно почати у твоїй ситуації.",
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="📝 Підібрати формат", callback_data="apply")],
-                    [InlineKeyboardButton(text="👨‍💻 Написати Михайлу", url=CONTACT_URL)],
-                ]
-            ),
-        )
+REMINDER_COPY = {
+    'welcome': (
+        '🎁 Ти запустив бота, але ще не відкрив безкоштовний урок. Натисни кнопку нижче — почнемо з доступу до відео.',
+        '▶️ Урок про практичну логіку P2P залишається доступним. Почни, коли матимеш час переглянути матеріал уважно.',
+        '💡 В уроці розбираємо послідовність роботи зі зв’язкою та розрахунок результату з урахуванням комісій. Відкрити його можна нижче.',
+        '📚 Хочеш розібратися в P2P на конкретному прикладі? Повернися до безкоштовного уроку — доступ ще є.',
+        '👋 Останнє нагадування про відкриття уроку на цьому етапі. Матеріал і меню залишаться доступними, навіть якщо вирішиш повернутися пізніше.',
+    ),
+    'subscribe': (
+        '🔐 Залишилося підтвердити підписку на канал, щоб відкрити урок. Після вступу натисни «Перевірити підписку».',
+        '🎁 Відеоурок чекає в боті. Підпишися на канал за кнопкою та повернися сюди для перевірки.',
+        '📌 Якщо ти вже вступив до каналу, натисни перевірку підписки. Сам перехід за посиланням ще не підтверджує вступ.',
+        '▶️ Щоб продовжити до відео, перевір підписку кнопкою нижче. Якщо доступ не відкривається, напиши @P2P_Marshal.',
+        '👋 Останнє нагадування на етапі підписки. Коли будеш готовий, підтвердь вступ — урок залишиться доступним у боті.',
+    ),
+    'open_lesson': (
+        '▶️ Доступ до уроку відкрито. Натисни кнопку, щоб отримати відео в цьому чаті.',
+        '🎬 Ти вже пройшов перевірку підписки. Наступний крок — відкрити відеоурок кнопкою нижче.',
+        '💡 Урок допоможе розібрати курс, комісії та ризики на практичному прикладі. Відео можна отримати тут.',
+        '📚 Якщо відкладав урок, повернися до нього, коли буде зручно. Кнопка нижче відкриває відео.',
+        '👋 Останнє нагадування про отримання відео на цьому етапі. Доступ і кнопка уроку залишаються в боті.',
+    ),
+    'watch': (
+        '🎬 Урок уже надіслано. Коли переглянеш його, натисни «Я переглянув урок» — далі підберемо формат навчання.',
+        '🧮 Під час перегляду зверни увагу на розрахунок після комісій і перевірку ризиків. Після уроку познач перегляд кнопкою.',
+        '📚 Якщо не встиг додивитися відео, повернися до нього. Бот не визначає фактичний перегляд — підтверди його сам, коли завершиш.',
+        '📝 Уже переглянув урок? Познач це кнопкою нижче, щоб перейти до короткої анкети й рекомендації формату.',
+        '👋 Останнє нагадування про перегляд на цьому етапі. Відео залишається доступним; після перегляду можеш продовжити анкету.',
+    ),
+    'form_start': (
+        '📝 Ти позначив урок переглянутим. Тепер 4 короткі запитання допоможуть підібрати формат під твій досвід і цілі.',
+        '🎯 Хочеш зрозуміти наступний крок після уроку? Почни анкету: відповіді обираються кнопками.',
+        '💬 У кожного свій досвід, капітал і потреба в підтримці. В анкеті врахуємо саме твою ситуацію.',
+        '📚 Після 4 відповідей бот покаже рекомендований формат навчання. Це рекомендація — рішення залишиться за тобою.',
+        '👋 Останнє нагадування почати анкету на цьому етапі. Якщо навчання актуальне, можеш пройти її кнопкою нижче.',
+    ),
+    'form_exp': (
+        '📝 Зупинилися на питанні 1/4: який у тебе досвід у P2P? Обери варіант, який найближчий до твоєї ситуації.',
+        '🌱 Якщо ще не проводив угод — обери «Новачок». Досвід потрібен, щоб рекомендація відповідала твоєму старту.',
+        '🎯 Підбір формату починається з досвіду: новачок, перші угоди чи вже працюєш. Повернися до першого питання.',
+        '💬 Не потрібно мати великий досвід, щоб пройти анкету. Просто познач свій поточний рівень.',
+        '👋 Останнє нагадування про питання «Досвід». Анкета збережена, продовжити можна нижче.',
+    ),
+    'form_cap': (
+        '📝 Твій досвід збережено. Наступне питання 2/4 — який капітал плануєш використовувати для практики?',
+        '🧮 Залишилося обрати діапазон капіталу. Це допомагає врахувати масштаб практики; точну суму чи банківські дані не просимо.',
+        '📌 Повернися до питання про капітал і вибери найближчий діапазон. Попередню відповідь повторювати не потрібно.',
+        '🎯 Капітал — один з орієнтирів підбору формату. Вкажи суму, яку саме плануєш виділити на практику.',
+        '👋 Останнє нагадування про питання «Капітал». Твоя попередня відповідь збережена — можеш продовжити звідси.',
+    ),
+    'form_goal': (
+        '📝 Досвід і капітал збережені. Питання 3/4: яка твоя головна ціль у P2P?',
+        '🎯 Стартувати з нуля, побудувати систему чи збільшити обороти? Обери ціль, яка зараз найближча тобі.',
+        '📌 Для рекомендації залишилося уточнити ціль і потрібну підтримку. Продовж із питання про ціль.',
+        '💬 Подумай, що хочеш змінити у своїй роботі з P2P насамперед. Відповідь допоможе підібрати доречний формат.',
+        '👋 Останнє нагадування про питання «Ціль». Відповіді збережені — повернутися до анкети можна нижче.',
+    ),
+    'form_support': (
+        '📝 Залишилося питання 4/4: який рівень підтримки тобі потрібний — самостійно, з групою чи з максимальним супроводом?',
+        '🤝 Обери зручний рівень підтримки. Це остання відповідь перед рекомендацією формату навчання.',
+        '🎯 Досвід, капітал і ціль уже збережені. Залишилося уточнити, наскільки важлива для тебе допомога ментора.',
+        '📚 Продовж останнє питання анкети — після відповіді бот сформує рекомендацію під твою ситуацію.',
+        '👋 Останнє нагадування про питання «Підтримка». Можеш завершити анкету одним вибором нижче.',
+    ),
+    'offer': (
+        '🎯 Рекомендація за твоїми відповідями готова. Якщо хочеш обговорити формат навчання, натисни «Хочу консультацію».',
+        '💬 Є запитання щодо рекомендованого формату? Залиш контакт через кнопку — Михайло зможе написати тобі.',
+        '📚 Анкета допомогла визначити орієнтир. На консультації можна уточнити програму та потрібний рівень підтримки.',
+        '🤝 Якщо плануєш навчання, зроби наступний крок — залиш контакт для обговорення своєї ситуації.',
+        '👋 Останнє нагадування про консультацію на цьому етапі. Рекомендація збережена; залишити контакт можна й пізніше.',
+    ),
+    'contact': (
+        '📲 Ти обрав консультацію, але контакт ще не збережено. Залиш свій номер або натисни «Використати мій Telegram».',
+        '💬 Для завершення заявки залишився контакт. Можна використати власний Telegram замість номера телефону.',
+        '📝 Відповіді анкети збережені. Повернися до введення контакту — повторно заповнювати анкету не потрібно.',
+        '🤝 Якщо консультація актуальна, підтвердь зручний контакт. Михайло зможе обговорити з тобою наступний крок.',
+        '👋 Останнє нагадування залишити контакт на цьому етапі. Після його збереження автоматичні нагадування припиняться.',
+    ),
+}
+
+
+async def send_scheduled_message(bot: Bot, kind: str, user_id: int, user: sqlite3.Row) -> bool:
+    # Re-read immediately before sending: a previously fetched queue item may be stale.
+    current=get_user(user_id)
+    if should_skip_scheduled(kind,current): return False
+    with connect() as db:
+        pending=db.execute('SELECT 1 FROM scheduled_messages WHERE user_id=? AND kind=? AND canceled_at IS NULL AND sent_at IS NULL',(user_id,kind)).fetchone()
+    if not pending: return False
+    step=kind.split(':')[2]
+    index=int(kind.split(':')[3])-1
+    text=REMINDER_COPY[step][index]
+    if step=='subscribe':
+        rows=list(subscription_menu().inline_keyboard)
     else:
-        raise ValueError(f"Unknown scheduled message kind: {kind}")
+        action,label={
+            'welcome':('lesson','🎁 Отримати урок'),
+            'open_lesson':('watch_lesson','▶️ Відкрити відеоурок'),
+            'watch':('watch_lesson','▶️ Повернутися до уроку'),
+            'form_start':('resume_form','📝 Підібрати формат'),
+            'offer':('contact_start','💬 Хочу консультацію'),
+            'contact':('contact_start','📲 Залишити контакт'),
+        }.get(step,('resume_form','📝 Продовжити анкету'))
+        rows=[[InlineKeyboardButton(text=label,callback_data=action)]]
+        if step=='watch': rows.append([InlineKeyboardButton(text='✅ Я переглянув урок',callback_data='lesson_done')])
+    rows.append([InlineKeyboardButton(text='🔕 Вимкнути нагадування',callback_data='stop_reminders')])
+    await bot.send_message(user_id,text,reply_markup=InlineKeyboardMarkup(inline_keyboard=rows))
+    return True
 
 
 async def funnel_worker(bot: Bot) -> None:
@@ -1723,7 +1846,11 @@ async def funnel_worker(bot: Bot) -> None:
                         db.commit()
                     continue
                 try:
-                    await send_scheduled_message(bot, row["kind"], row["user_id"], user)
+                    sent=await send_scheduled_message(bot, row["kind"], row["user_id"], user)
+                    if not sent:
+                        with connect() as db:
+                            db.execute('UPDATE scheduled_messages SET canceled_at=COALESCE(canceled_at,?) WHERE id=?',(now_iso(),row['id']))
+                        continue
                     with connect() as db:
                         db.execute(
                             "UPDATE scheduled_messages SET sent_at=? WHERE id=?",
@@ -1732,12 +1859,9 @@ async def funnel_worker(bot: Bot) -> None:
                         db.commit()
                     record_event(row["user_id"], f"timer_{row['kind']}")
                 except TelegramForbiddenError:
+                    update_user(row['user_id'],reminders_enabled=0)
                     with connect() as db:
-                        db.execute(
-                            "UPDATE scheduled_messages SET canceled_at=?, last_error=? WHERE id=?",
-                            (now_iso(), "bot blocked by user", row["id"]),
-                        )
-                        db.commit()
+                        db.execute('UPDATE scheduled_messages SET last_error=? WHERE id=?',('bot blocked by user',row['id']))
                 except Exception as exc:
                     logging.exception("Failed scheduled message %s", row["id"])
                     attempts = row["attempts"] + 1
@@ -1769,11 +1893,7 @@ async def main() -> None:
         if parsed.scheme not in {'http', 'https'} or not parsed.hostname or any(c.isspace() for c in value):
             raise RuntimeError(f'{name}: expected an http(s) URL without spaces')
     connect().close()
-    with connect() as db:
-        unfinished = db.execute('''SELECT telegram_id FROM users WHERE reminders_enabled=1 AND contact IS NULL
-            AND stage IN ('lesson_completed','questionnaire_started','recommendation_shown','contact_requested')''').fetchall()
-    for user in unfinished:
-        schedule_form_reminder(user['telegram_id'])
+    initialize_stage_reminders()
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
     dp = Dispatcher(storage=SQLiteStorage(), events_isolation=SimpleEventIsolation())
     dp.include_router(router)
