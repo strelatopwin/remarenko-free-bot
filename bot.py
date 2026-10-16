@@ -39,7 +39,7 @@ from aiogram.types import (
 )
 
 
-BOT_VERSION = "2.1.8"
+BOT_VERSION = "2.1.10"
 BOT_TOKEN = os.environ["BOT_TOKEN"].strip()
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "788167958"))
 DATABASE_PATH = os.getenv("DATABASE_PATH", "/data/remarenko_free.sqlite3")
@@ -565,6 +565,12 @@ def lead_condition(view: dict, status=None):
     if view.get('tariff', 'any') in TARIFF_NAMES:
         clauses.append('recommendation=?')
         params.append(view['tariff'])
+    if view.get('via_bot'):
+        clauses.append(
+            'EXISTS(SELECT 1 FROM channel_joins '
+            'WHERE channel_joins.user_id=users.telegram_id '
+            'AND channel_joins.via_bot_link=1)'
+        )
     # Date means first entry into the bot; a later status change cannot change this date.
     if view.get('date') in {'today', 'week'}:
         now = utc_now()
@@ -592,11 +598,19 @@ def lead_rows(view: dict, page=None):
 
 def view_description(view):
     lines = []
+    if view.get('via_bot'):
+        lines.append('Лише нові вступи в канал за посиланням із бота')
     if view.get('stage', 'any') != 'any': lines.append('Етап: '+STAGE_FILTERS[view['stage']])
     if view.get('tariff', 'any') != 'any': lines.append('Тариф: '+TARIFF_NAMES[view['tariff']])
     if view.get('date', 'any') != 'any': lines.append('Вхід у бот: '+DATE_FILTERS[view['date']])
     if view.get('search'): lines.append('Пошук: '+view['search'])
     return '\n'.join(lines)
+
+
+def lead_view_title(view: dict) -> str:
+    if view.get('via_bot'):
+        return '🔗 Підписалися через бота'
+    return LEAD_STATUSES[view['status']]
 
 
 async def edit_admin(message, text, markup):
@@ -611,7 +625,7 @@ async def show_leads(message: Message, status: str = 'new', page: int = 0, edit:
     if not view or page < 0: return
     count, page, rows = lead_rows(view, page)
     set_setting('admin_current_view', status)
-    text = f'<b>{LEAD_STATUSES[view["status"]]}</b> · {count}\nСторінка {page+1} із {max(1,(count+7)//8)}\n'
+    text = f'<b>{lead_view_title(view)}</b> · {count}\nСторінка {page+1} із {max(1,(count+7)//8)}\n'
     description = view_description(view)
     if description: text += html.escape(description)+'\n'
     text += '\n'
@@ -622,6 +636,12 @@ async def show_leads(message: Message, status: str = 'new', page: int = 0, edit:
         text += f"• {html.escape(name[:60])} · {html.escape(label)}\n"
         keyboard.append([InlineKeyboardButton(text=f'{name[:40]} · {label}', callback_data=f'adminlead:detail:{row["telegram_id"]}:{status}:{page}')])
     if not rows: text += 'За цим відбором нікого не знайдено.'
+    keyboard.append([
+        InlineKeyboardButton(
+            text='🔄 Оновити список',
+            callback_data=f'adminlead:list:{status}:{page}',
+        )
+    ])
     nav = []
     last = max(0,(count-1)//8)
     for label, target in [('⏮',0),('⬅️',page-1),('➡️',page+1),('⏭',last)]:
@@ -632,8 +652,26 @@ async def show_leads(message: Message, status: str = 'new', page: int = 0, edit:
                      InlineKeyboardButton(text='🎛 Фільтри',callback_data=f'av:filters:{status}')])
     keyboard.append([InlineKeyboardButton(text='🔢 До сторінки',callback_data=f'av:page:{status}'),
                      InlineKeyboardButton(text='📥 Excel',callback_data=f'av:export:{status}')])
+    via_bot_view = {**resolve_lead_view('people'), 'via_bot': True}
+    via_bot_origin = save_lead_view(via_bot_view)
+    via_bot_count = lead_rows(via_bot_view, 0)[0]
     with connect() as db:
+        pending_timers = db.execute(
+            'SELECT COUNT(*) FROM scheduled_messages '
+            'WHERE sent_at IS NULL AND canceled_at IS NULL'
+        ).fetchone()[0]
         for key in LEAD_STATUSES:
+            if key == 'all':
+                keyboard.append([
+                    InlineKeyboardButton(
+                        text=f'⏳ На таймері · {pending_timers}',
+                        callback_data=f'av:timers:{status}',
+                    ),
+                    InlineKeyboardButton(
+                        text=f'🔗 Через бота · {via_bot_count}',
+                        callback_data=f'adminlead:list:{via_bot_origin}:0',
+                    ),
+                ])
             condition, params = lead_condition(view, key)
             n = db.execute(f'SELECT COUNT(*) FROM users WHERE {condition}',params).fetchone()[0]
             target = key if not description else save_lead_view({**view,'status':key})
@@ -696,8 +734,10 @@ def main_menu(user_id: int | None = None) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📚 Програма навчання", callback_data="program")],
         [InlineKeyboardButton(text="💎 Тарифи", callback_data="tariffs")],
     ]
-    if user and user['recommendation']:
+    if user and user['recommendation'] and user['contact']:
         rows.append([InlineKeyboardButton(text="▶️ Переглянути урок",callback_data="watch_lesson")])
+    elif user and user['recommendation']:
+        rows.append([InlineKeyboardButton(text="📲 Залишити контакт й отримати урок",callback_data="contact_start")])
     elif user and user['questionnaire_started_at']:
         rows.append([InlineKeyboardButton(text="📝 Продовжити анкету",callback_data="resume_form")])
     rows.append([InlineKeyboardButton(text="👨‍💻 Написати Михайлу", url=CONTACT_URL)])
@@ -715,11 +755,16 @@ def subscription_menu() -> InlineKeyboardMarkup:
     )
 
 
-def lesson_menu(ready: bool = False) -> InlineKeyboardMarkup:
+def lesson_menu(ready: bool = False, contact_required: bool = False) -> InlineKeyboardMarkup:
+    if ready:
+        label, callback_data = "▶️ Переглянути урок", "watch_lesson"
+    elif contact_required:
+        label, callback_data = "📲 Залишити контакт й отримати урок", "contact_start"
+    else:
+        label, callback_data = "📝 Пройти анкету й отримати урок", "resume_form"
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="▶️ Переглянути урок" if ready else "📝 Пройти анкету й отримати урок",
-                                  callback_data="watch_lesson" if ready else "resume_form")],
+            [InlineKeyboardButton(text=label, callback_data=callback_data)],
             [InlineKeyboardButton(text="🏠 Головне меню", callback_data="menu")],
         ]
     )
@@ -829,21 +874,26 @@ async def send_lesson_card(message: Message, confirmed: bool = False) -> None:
         "4 короткі запитання. Бот підбере формат навчання, після чого залиш "
         "номер телефону або свій Telegram — і безкоштовний урок відкриється."
     )
-    ready = bool(user and user['recommendation'])
-    if ready and user['contact']:
+    ready = bool(user and user['recommendation'] and user['contact'])
+    contact_required = bool(user and user['recommendation'] and not user['contact'])
+    if ready:
         caption = (prefix + "✅ <b>Твоя анкета вже завершена.</b>\n\n"
                    "Контакт збережено. Безкоштовний урок про практичну P2P-зв’язку доступний кнопкою нижче.")
-    elif ready:
+    elif contact_required:
         caption = (prefix + "🎯 <b>Твоя анкета вже завершена, тариф підібрано.</b>\n\n"
-                   "Натисни кнопку уроку й залиш номер телефону або свій Telegram — після цього відео відкриється.")
+                   "Залиш номер телефону або свій Telegram — після цього бот покаже 5 кнопок і відкриє відеоурок.")
     cover_id = get_setting("lesson_cover_file_id")
     if cover_id:
         try:
-            await message.answer_photo(photo=cover_id, caption=caption, reply_markup=lesson_menu(ready))
+            await message.answer_photo(
+                photo=cover_id,
+                caption=caption,
+                reply_markup=lesson_menu(ready, contact_required),
+            )
             return
         except TelegramBadRequest:
             logging.exception("Stored lesson cover is invalid; falling back to text")
-    await message.answer(caption, reply_markup=lesson_menu(ready))
+    await message.answer(caption, reply_markup=lesson_menu(ready, contact_required))
 
 
 async def send_lesson_video(message: Message) -> None:
@@ -1001,8 +1051,9 @@ def recommendation_text(tariff: str, reason: str) -> str:
         f"За твоїми відповідями тобі {html.escape(reason)}.\n\n"
         f"{details}\n\n"
         "Це рекомендація за відповідями, а не гарантія фінансового результату. "
-        "Анкету завершено ✅ П’ять наступних дій уже показані нижче. "
-        "Щоб активувати їх, поділися номером телефону або своїм Telegram."
+        "Анкету завершено ✅ Щоб відкрити безкоштовний урок та наступні дії, "
+        "поділися номером телефону або своїм Telegram. Після збереження "
+        "контакту бот покаже 5 кнопок."
     )
 
 
@@ -1027,7 +1078,7 @@ async def send_recommendation(
     )
     record_event(message.chat.id, "recommendation_shown", tariff)
     queue_questionnaire(message.chat.id)
-    await message.answer(recommendation_text(tariff, reason), reply_markup=recommendation_menu(tariff))
+    await message.answer(recommendation_text(tariff, reason))
     await request_required_contact(message, message.chat.id, state)
     await deliver_lead_notifications(message.bot)
 
@@ -1056,6 +1107,22 @@ async def admin_view_callback(callback: CallbackQuery):
     if not view: 
         await callback.answer('Відкрий /leads ще раз',show_alert=True)
         return
+    if action == 'timers':
+        with connect() as db:
+            pending = db.execute(
+                'SELECT COUNT(*) FROM scheduled_messages '
+                'WHERE sent_at IS NULL AND canceled_at IS NULL'
+            ).fetchone()[0]
+            people = db.execute(
+                'SELECT COUNT(DISTINCT user_id) FROM scheduled_messages '
+                'WHERE sent_at IS NULL AND canceled_at IS NULL'
+            ).fetchone()[0]
+        await callback.answer(
+            f'⏳ У черзі {pending} повідомлень для {people} людей. '
+            'Таймери: 1, 5, 24, 48 і 72 години.',
+            show_alert=True,
+        )
+        return
     await callback.answer()
     set_setting('admin_pending_input','')
     if action=='filters':
@@ -1078,7 +1145,7 @@ async def admin_view_callback(callback: CallbackQuery):
         data=await asyncio.to_thread(excel_bytes,rows)
         stamp=utc_now().astimezone(KYIV).strftime('%Y-%m-%d_%H-%M')
         description=view_description(view)
-        caption=f'📥 {LEAD_STATUSES[view["status"]]} · {len(rows)} записів\n{description}\nЗнімок даних на момент експорту. Зміни в Excel не змінюють бот.'
+        caption=f'📥 {lead_view_title(view)} · {len(rows)} записів\n{description}\nЗнімок даних на момент експорту. Зміни в Excel не змінюють бот.'
         await callback.message.answer_document(BufferedInputFile(data,filename=f'Remarenko_leads_{stamp}.xlsx'),caption=html.escape(caption[:1000]))
 
 
@@ -1428,10 +1495,21 @@ async def admin_lead_callback(callback: CallbackQuery) -> None:
                 if key == 'stage': value = STAGE_LABELS.get(value, value)
                 if key == 'recommendation': value = TARIFF_NAMES.get(value, value)
                 text += f'{label}: {html.escape(str(value))}\n'
+            with connect() as db:
+                joined_via_bot = db.execute(
+                    'SELECT 1 FROM channel_joins '
+                    'WHERE user_id=? AND via_bot_link=1',
+                    (uid,),
+                ).fetchone()
+                upcoming = db.execute(
+                    'SELECT MIN(due_at) FROM scheduled_messages '
+                    'WHERE user_id=? AND sent_at IS NULL AND canceled_at IS NULL',
+                    (uid,),
+                ).fetchone()[0]
+            if joined_via_bot:
+                text += 'Вступ у канал через бота: ✅\n'
             text += '\nЗупинка: '+html.escape(REMINDER_STEP_LABELS[reminder_step(user)])+'\n'
             text += 'Нагадування: '+('увімкнено' if user['reminders_enabled'] else 'вимкнено користувачем / недоступні')+'\n'
-            with connect() as db:
-                upcoming=db.execute('SELECT MIN(due_at) FROM scheduled_messages WHERE user_id=? AND sent_at IS NULL AND canceled_at IS NULL',(uid,)).fetchone()[0]
             if upcoming:
                 text += 'Наступне (Київ): '+datetime.fromisoformat(upcoming).astimezone(KYIV).strftime('%d.%m.%Y %H:%M')+'\n'
             try:

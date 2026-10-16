@@ -167,7 +167,8 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(bot.get_user(50)['lesson_received_at'])
         bot.update_user(50,stage='recommendation_shown',recommendation='BASIC')
         await bot.send_lesson_card(message)
-        self.assertEqual(message.answer_photo.call_args.kwargs['reply_markup'].inline_keyboard[0][0].callback_data,'watch_lesson')
+        self.assertEqual(message.answer_photo.call_args.kwargs['reply_markup'].inline_keyboard[0][0].callback_data,'contact_start')
+        self.assertFalse(any(button.callback_data=='watch_lesson' for row in bot.main_menu(50).inline_keyboard for button in row))
         await bot.watch_lesson(callback,state)
         state.set_state.assert_awaited_with(bot.LeadForm.contact)
         self.assertIsNone(bot.get_user(50)['lesson_received_at'])
@@ -483,11 +484,11 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(bot.get_user(50)['contact'])
         self.assertEqual(bot.get_user(50)['stage'],'contact_requested')
         state.set_state.assert_awaited_once_with(bot.LeadForm.contact)
-        first_markup=message.answer.await_args_list[0].kwargs['reply_markup']
-        self.assertEqual(sum(len(row) for row in first_markup.inline_keyboard),5)
+        self.assertNotIn('reply_markup',message.answer.await_args_list[0].kwargs)
+        contact_markup=message.answer.await_args_list[1].kwargs['reply_markup']
         self.assertEqual(
-            [button.callback_data for row in first_markup.inline_keyboard for button in row],
-            ['watch_lesson','rec_details:BASIC','contact_start','rec_site','rec_home'],
+            [button.text for row in contact_markup.keyboard for button in row],
+            ['📱 Поділитися номером','Використати мій Telegram'],
         )
         api.send_message.assert_awaited_once()
         view=SimpleNamespace(answer=AsyncMock())
@@ -574,19 +575,68 @@ class AsyncRegressionTests(unittest.IsolatedAsyncioTestCase):
         markup=message.answer.call_args.kwargs['reply_markup']
         self.assertTrue(markup.inline_keyboard[0][0].callback_data.endswith(':people:1'))
 
+    async def test_admin_list_has_refresh_timer_counter_and_bot_join_button(self):
+        bot.update_user(50,stage='questionnaire_started')
+        message=SimpleNamespace(answer=AsyncMock())
+        await bot.show_leads(message,'people',0)
+        markup=message.answer.call_args.kwargs['reply_markup']
+        buttons=[button for row in markup.inline_keyboard for button in row]
+        by_text={button.text:button for button in buttons}
+        self.assertEqual(by_text['🔄 Оновити список'].callback_data,'adminlead:list:people:0')
+        self.assertEqual(by_text['⏳ На таймері · 5'].callback_data,'av:timers:people')
+        joined_callback=by_text['🔗 Через бота · 0'].callback_data
+        self.assertRegex(joined_callback,r'^adminlead:list:v[0-9a-f]{16}:0$')
+        joined_origin=joined_callback.split(':')[2]
+        self.assertTrue(bot.resolve_lead_view(joined_origin)['via_bot'])
+        self.assertTrue(any(button.text.startswith('📋 Усі заявки ·') for button in buttons))
+        self.assertTrue(any(button.text.startswith('👥 Усі в боті ·') for button in buttons))
+
+        timer_callback=SimpleNamespace(
+            from_user=SimpleNamespace(id=bot.ADMIN_CHAT_ID),
+            answer=AsyncMock(),message=message,data='av:timers:people',
+        )
+        await bot.admin_view_callback(timer_callback)
+        self.assertIn('У черзі 5 повідомлень',timer_callback.answer.call_args.args[0])
+        self.assertTrue(timer_callback.answer.call_args.kwargs['show_alert'])
+
     async def test_join_count_is_unique_and_identifies_invite(self):
         previous=bot.CHANNEL_ID
         bot.CHANNEL_ID='-10042'
         try:
+            with bot.connect() as db:
+                db.execute("UPDATE users SET first_name='Через бот' WHERE telegram_id=50")
+                db.execute("INSERT INTO users(telegram_id,first_name,subscribed,created_at,updated_at) VALUES(51,'Був підписаний',1,?,?)",(bot.now_iso(),bot.now_iso()))
+                db.execute("INSERT INTO users(telegram_id,first_name,created_at,updated_at) VALUES(52,'Інше посилання',?,?)",(bot.now_iso(),bot.now_iso()))
             user=SimpleNamespace(id=50,is_bot=False)
             event=SimpleNamespace(chat=SimpleNamespace(id=-10042,username=None),date=datetime.now(timezone.utc),
                 old_chat_member=SimpleNamespace(status='left'),new_chat_member=SimpleNamespace(status='member',user=user),
                 invite_link=SimpleNamespace(invite_link=bot.CHANNEL_URL))
             await bot.track_channel_join(event)
             await bot.track_channel_join(event)
+            external_event=SimpleNamespace(chat=event.chat,date=event.date,
+                old_chat_member=event.old_chat_member,
+                new_chat_member=SimpleNamespace(status='member',user=SimpleNamespace(id=52,is_bot=False)),
+                invite_link=SimpleNamespace(invite_link='https://t.me/+another_link'))
+            await bot.track_channel_join(external_event)
             with bot.connect() as db:
                 count,via=db.execute('SELECT COUNT(*),SUM(via_bot_link) FROM channel_joins').fetchone()
-            self.assertEqual((count,via),(1,1))
+            self.assertEqual((count,via),(2,1))
+
+            message=SimpleNamespace(answer=AsyncMock())
+            await bot.show_leads(message,'people',0)
+            buttons=[button for row in message.answer.call_args.kwargs['reply_markup'].inline_keyboard for button in row]
+            joined_button=next(button for button in buttons if button.text.startswith('🔗 Через бота'))
+            self.assertEqual(joined_button.text,'🔗 Через бота · 1')
+            joined_origin=joined_button.callback_data.split(':')[2]
+            count,_,rows=bot.lead_rows(bot.resolve_lead_view(joined_origin),0)
+            self.assertEqual(count,1)
+            self.assertEqual([row['first_name'] for row in rows],['Через бот'])
+
+            joined_message=SimpleNamespace(answer=AsyncMock())
+            await bot.show_leads(joined_message,joined_origin,0)
+            self.assertIn('Підписалися через бота',joined_message.answer.call_args.args[0])
+            self.assertNotIn('Був підписаний',joined_message.answer.call_args.args[0])
+            self.assertNotIn('Інше посилання',joined_message.answer.call_args.args[0])
         finally: bot.CHANNEL_ID=previous
 
     async def test_full_questionnaire_through_real_dispatcher(self):
